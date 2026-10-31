@@ -126,7 +126,7 @@ def transactions(days: int = 90, account: str = "", symbol: str = "", kind: str 
     return _run(tools.transactions, days, account, symbol, kind, limit, detail)
 
 
-@_tool("Net worth and allocation by account type and security type, per currency.")
+@_tool("Net worth from account balances; allocation by account and security type, per currency.")
 def summary(currency: str = "CAD") -> str:
     return _run(tools.summary, currency)
 

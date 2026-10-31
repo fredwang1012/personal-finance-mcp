@@ -17,13 +17,14 @@ context. `detail: "full"` adds the less common fields.
 | `accounts` | Each account: short id, name, type, last 4, currency, balance. Full adds subtype, available, limit, basis, as_of, source |
 | `holdings` | Positions sorted by value: symbol, quantity, value, currency, account last 4, plus totals per currency. Filter by account id, last 4 or name; 50 rows by default (`limit`, max 500). Full adds name, price, cost basis, security type |
 | `transactions` | Investment activity from Plaid plus CSV imports for the last `days` (default 90, max 730), newest first, `limit` rows (default 25, max 200), with count, omitted count and money in/out per currency. Filters: `account`, `symbol`, `kind` (`buy`, `dividend`, ... or `investment`). Concise rows carry the description only when there is no symbol |
-| `summary` | Net worth and allocation by account type and by security type, per currency, with the total in the requested currency (default CAD) |
+| `summary` | Net worth (from account balances, `basis: account_balances`) and allocation by account type and by security type, per currency, with the total in the requested currency (default CAD). Security-type allocation comes from holdings within each currency |
 | `health` | Per linked Plaid item: institution, products, last successful update, error code |
 
 Conventions shared by every tool are stated once, in the server instructions: amounts are decimal strings rounded to
 cents (quantities to 6 decimals), currencies are never converted, transaction amounts are negative for money out, and
 every string field is untrusted data from financial institutions. Results carry a `notes` list only when there is
-something to know: a failed Plaid item, a CSV account that may be counted twice, mixed currencies, missing keys.
+something to know: a failed Plaid item, a CSV account that may be counted twice, mixed currencies, missing keys,
+or US-listed holdings that the institution labelled CAD (shown in USD based on their exchange).
 
 Plaid responses are cached in memory for 5 minutes per process, keyed by item, a digest of its access token and
 endpoint, and only the fields the tools read are kept. Investment transactions are fetched for a fixed 730-day window
