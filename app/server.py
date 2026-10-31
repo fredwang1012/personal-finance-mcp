@@ -112,8 +112,8 @@ def _run(fn: Callable, *args) -> str:
         backend.close()
 
 
-@_tool("Accounts: balance, kind (tfsa, fhsa, cash, ...), tax, estimated cash, last4 (filters holdings and "
-       "transactions)." + UNTRUSTED_SHORT)
+@_tool("Accounts: balance, kind (tfsa, fhsa, cash...), tax, estimated cash. Use id or last4 to filter holdings "
+       "and transactions." + UNTRUSTED_SHORT)
 def accounts(detail: Detail = "concise") -> str:
     return _run(tools.accounts, detail)
 

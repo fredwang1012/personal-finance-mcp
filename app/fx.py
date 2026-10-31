@@ -1,8 +1,9 @@
 """The public USD/CAD rate from the Bank of Canada Valet API, used only to estimate cash in investment accounts.
 
 This is the server's one outbound request besides Plaid: a GET to one fixed URL on one allow-listed host, with no
-parameters, cookies or credentials, so nothing about the owner is sent. Redirects are refused, the response is capped,
-and the rate is cached in memory for TTL. A failure returns None (the caller omits its estimates with a note) and is
+parameters, cookies or credentials, so nothing about the owner is sent. Proxies from the environment and redirects
+are ignored, the response is capped in size and time, the rate must look like one (a few decimals, 0.5 to 3), and
+it is cached in memory for TTL. A failure returns None (the caller omits its estimates with a note) and is
 remembered for RETRY_AFTER, so tool calls don't each wait on a timeout. FX_ENABLED=false turns it off.
 """
 import json
@@ -20,13 +21,19 @@ from typing import Callable
 VALET_URL = "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?recent=1"
 ALLOWED_HOST = "www.bankofcanada.ca"
 SERIES = "FXUSDCAD"
-TIMEOUT = 5  # seconds
+TIMEOUT = 5  # seconds, per socket operation
+DEADLINE = 8  # seconds for the whole read, so a slow server can't hold the cache lock for long
+CHUNK = 8192
 TTL = 12 * 3600  # seconds
 RETRY_AFTER = 600  # seconds between attempts after a failure
 MAX_BYTES = 64 * 1024
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-# a sanity range, far wider than USD/CAD has ever moved; anything outside it is a parse problem, not a rate
-LOW, HIGH = Decimal("0.5"), Decimal("5")
+# Valet publishes four decimals; a bounded shape stops a hostile or broken response from putting a huge number
+# into every tool result
+RATE_RE = re.compile(r"\d\.\d{1,8}")
+STEP = Decimal("0.0001")
+# a sanity range, wider than USD/CAD has ever moved; anything outside it is a parse problem, not a rate
+LOW, HIGH = Decimal("0.5"), Decimal("3")
 
 
 @dataclass(frozen=True)
@@ -43,10 +50,15 @@ def parse(payload: dict) -> Rate:
     try:
         obs = payload["observations"][-1]
         day, raw = obs["d"], obs[SERIES]["v"]
-        rate = Decimal(str(raw))
-    except (KeyError, IndexError, TypeError, InvalidOperation) as exc:
+    except (KeyError, IndexError, TypeError) as exc:
         raise ValueError("unexpected Valet response") from exc
-    if not isinstance(day, str) or not DATE_RE.fullmatch(day) or not rate.is_finite() or not LOW < rate < HIGH:
+    if not isinstance(day, str) or not DATE_RE.fullmatch(day) or not isinstance(raw, str) or not RATE_RE.fullmatch(raw):
+        raise ValueError("unexpected Valet response")
+    try:
+        rate = Decimal(raw).quantize(STEP)
+    except InvalidOperation as exc:
+        raise ValueError("unexpected Valet response") from exc
+    if not LOW < rate < HIGH:
         raise ValueError("unexpected Valet response")
     return Rate(rate, day)
 
@@ -58,9 +70,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
 
 
-def _urlopen(request: urllib.request.Request, timeout: float):
-    handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())]
+def _open_direct(request: urllib.request.Request, timeout: float):
+    # ProxyHandler({}) ignores proxy environment variables: the request goes straight to the allow-listed host
+    handlers = [urllib.request.ProxyHandler({}), _NoRedirect(),
+                urllib.request.HTTPSHandler(context=ssl.create_default_context())]
     return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+
+
+_urlopen = _open_direct  # the opener fetch uses; tests replace it with one that raises
 
 
 def _check_url(url: str) -> None:
@@ -69,14 +86,20 @@ def _check_url(url: str) -> None:
         raise ValueError("FX URL is not on the allow-listed host")
 
 
-def fetch(url: str = VALET_URL, opener: Callable | None = None) -> Rate:
-    """One GET to the Valet API. Raises on any network, HTTP or parse failure."""
+def fetch(url: str = VALET_URL, opener: Callable | None = None,
+          clock: Callable[[], float] = time.monotonic) -> Rate:
+    """One GET to the Valet API. Raises on any network, HTTP, size, deadline or parse failure."""
     _check_url(url)
     request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    start = clock()
+    body = b""
     with (opener or _urlopen)(request, timeout=TIMEOUT) as resp:
-        body = resp.read(MAX_BYTES + 1)
-    if len(body) > MAX_BYTES:
-        raise ValueError("Valet response too large")
+        while chunk := resp.read(CHUNK):
+            body += chunk
+            if len(body) > MAX_BYTES:
+                raise ValueError("Valet response too large")
+            if clock() - start > DEADLINE:
+                raise TimeoutError("Valet response too slow")
     return parse(json.loads(body))
 
 

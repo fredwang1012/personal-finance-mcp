@@ -18,7 +18,7 @@ SECURITIES = [
     {"security_id": "eur", "name": "Made Up Euro Fund", "ticker_symbol": "ZZEU", "type": "etf",
      "iso_currency_code": "EUR"},
 ]
-KINDS = {"tfsa", "fhsa", "rrsp", "resp", "rrif", "lira", "non_registered", "cash", "chequing", "credit_card",
+KINDS = {"tfsa", "fhsa", "rrsp", "resp", "rrif", "rdsp", "lira", "non_registered", "cash", "chequing", "credit_card",
          "line_of_credit", "other"}
 
 
@@ -81,6 +81,12 @@ def by_name(out):
     ("margin", "USD account", False, ("non_registered", "subtype", "taxable")),
     ("non_registered", "", False, ("non_registered", "subtype", "taxable")),  # CSV account types
     ("managed_tfsa", "", False, ("tfsa", "subtype", "tax-free")),
+    ("rdsp", "", False, ("rdsp", "subtype", "tax-deferred")),
+    ("lrsp", "", False, ("lira", "subtype", "tax-deferred")),  # locked-in plans share the lira family
+    ("lif", "", False, ("lira", "subtype", "tax-deferred")),
+    ("lrif", "", False, ("lira", "subtype", "tax-deferred")),
+    ("prif", "", False, ("lira", "subtype", "tax-deferred")),
+    ("rlif", "", False, ("lira", "subtype", "tax-deferred")),
     # a generic subtype falls through to the name
     ("brokerage", "Self-directed FHSA", False, ("fhsa", "name", "tax-free")),
     ("brokerage", "Non-registered", False, ("non_registered", "name", "taxable")),
@@ -88,9 +94,19 @@ def by_name(out):
     ("brokerage", "Personal margin", False, ("non_registered", "name", "taxable")),
     ("brokerage", "Individual", False, ("non_registered", "name", "taxable")),
     ("brokerage", "My RRSP", False, ("rrsp", "name", "tax-deferred")),
+    ("brokerage", "Individual TFSA", False, ("tfsa", "name", "tax-free")),  # a registered plan beats "individual"
+    ("brokerage", "Margin RRSP", False, ("rrsp", "name", "tax-deferred")),
+    ("brokerage", "Locked-in LIF", False, ("lira", "name", "tax-deferred")),
     (None, "TFSA", False, ("tfsa", "name", "tax-free")),
     # then holdings: an investment account with none is cash
     ("brokerage", "Savings", True, ("cash", "no holdings", "n/a")),
+    ("cash management", "Spending", True, ("cash", "no holdings", "n/a")),
+    # only a generic brokerage subtype is cash when empty: crypto or unknown assets may just not be listed
+    ("crypto exchange", "Crypto", True, ("other", "subtype", "n/a")),
+    ("crypto", "", True, ("other", "subtype", "n/a")),
+    ("other", "Savings", True, ("other", "subtype", "n/a")),
+    (None, "Savings", True, ("other", "none", "n/a")),
+    ("", "Account", False, ("other", "none", "n/a")),
     ("brokerage", "Non-registered", True, ("non_registered", "name", "taxable")),  # the name still wins
     # never a guess
     ("brokerage", "Savings", False, ("other", "subtype", "n/a")),
@@ -204,10 +220,26 @@ def test_other_currency_holdings_omit_the_estimate(make):
     assert "cash_estimate" not in by_name(out)["TFSA"] and tools.OTHER_CCY_NOTE in out["notes"]
 
 
+def test_unrecognised_account_with_no_holdings_gets_no_estimate(make):
+    out = tools.accounts(make([acct("p-cx", "Crypto", "crypto exchange", 3000),
+                               acct("p-sav", "Savings", "brokerage", 250)]))
+    rows = by_name(out)
+    assert rows["Crypto"]["account_kind"] == "other" and "cash_estimate" not in rows["Crypto"]
+    assert rows["Savings"]["cash_estimate"] == "250.00"
+
+
 def test_tiny_negative_is_clamped_to_zero(make):
     out = tools.accounts(make([acct("p-tfsa", "TFSA", "tfsa", 1000)], [hold("p-tfsa", "cad", 1005)]))
     assert by_name(out)["TFSA"]["cash_estimate"] == "0.00"
     assert tools.NEGATIVE_NOTE not in out["notes"]
+
+
+def test_clamp_is_capped_at_fifty_dollars(make):
+    # 0.6% of the balance, but 60 dollars: too much to be timing, so no estimate
+    b = make([acct("p-a", "TFSA", "tfsa", 10000), acct("p-b", "RRSP", "rrsp", 10000)],
+             [hold("p-a", "cad", 10060), hold("p-b", "cad", 10050)])
+    rows = by_name(tools.accounts(b))
+    assert "cash_estimate" not in rows["TFSA"] and rows["RRSP"]["cash_estimate"] == "0.00"
 
 
 def test_large_negative_omits_the_estimate_with_a_note(make):
@@ -320,6 +352,20 @@ def test_summary_counts_csv_holdings_balances_as_invested(tmp_path):
     conn.close()
 
 
+def test_csv_account_kind_comes_from_its_type(tmp_path):
+    conn = store.connect(tmp_path / "r.db")
+    _csv_account(conn, "Retirement", "RRSP", "5555", value="400")
+    _csv_account(conn, "Wallet", "CASH", "6666", value="100")
+    b = tools.Backend(conn, None, {}, today=lambda: TODAY)
+    rows = by_name(tools.accounts(b))
+    assert (rows["Retirement"]["account_kind"], rows["Retirement"]["kind_basis"]) == ("rrsp", "subtype")
+    out = tools.summary(b)
+    # a CSV balance is a holdings value, so even a CASH-type CSV account counts as invested
+    assert out["invested_total"] == "500.00" and out["cash_total_estimate"] == "0.00"
+    assert any("count as invested, not cash" in n for n in out["notes"])
+    conn.close()
+
+
 # ---- untrusted input -----------------------------------------------------------------------------------------
 
 
@@ -332,7 +378,7 @@ def test_derived_fields_are_allow_listed_whatever_plaid_sends(make):
     outs = [tools.accounts(b), tools.accounts(b, "full"), tools.summary(b)]
     for out in outs[:2]:
         for a in out["accounts"]:
-            assert a["account_kind"] in KINDS and a["kind_basis"] in {"subtype", "name", "no holdings"}
+            assert a["account_kind"] in KINDS and a["kind_basis"] in {"subtype", "name", "no holdings", "none"}
             assert a["tax"] in {"tax-free", "tax-deferred", "taxable", "n/a"}
     assert set(outs[2]["by_kind"]) <= KINDS
     blob = json.dumps(outs)

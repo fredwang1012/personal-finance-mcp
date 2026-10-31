@@ -78,7 +78,9 @@ LIABILITY_KINDS = {"credit_card", "line_of_credit"}
 INVESTMENT_ACCOUNT_TYPES = {"investment", "brokerage"}  # Plaid's account type; "brokerage" is its legacy name
 # normalised subtype (or CSV account type) -> account_kind. "brokerage" is absent on purpose: it says nothing.
 SUBTYPE_KINDS = {
-    "tfsa": "tfsa", "fhsa": "fhsa", "rrsp": "rrsp", "resp": "resp", "rrif": "rrif", "lira": "lira",
+    "tfsa": "tfsa", "fhsa": "fhsa", "rrsp": "rrsp", "resp": "resp", "rrif": "rrif", "rdsp": "rdsp",
+    # locked-in plans (Plaid's Canadian subtypes) share the lira family
+    "lira": "lira", "lrsp": "lira", "lif": "lira", "lrif": "lira", "prif": "lira", "rlif": "lira",
     "nonregistered": "non_registered", "margin": "non_registered", "individual": "non_registered",
     "cash": "cash", "savings": "cash", "checking": "chequing", "chequing": "chequing",
     "creditcard": "credit_card", "lineofcredit": "line_of_credit",
@@ -86,13 +88,18 @@ SUBTYPE_KINDS = {
 # whole-word keywords in an account name (or in a longer subtype such as MANAGED_TFSA) -> account_kind
 NAME_KINDS = (
     ("fhsa", re.compile(r"\bfhsa\b")), ("tfsa", re.compile(r"\btfsa\b")), ("rrsp", re.compile(r"\brrsp\b")),
-    ("resp", re.compile(r"\bresp\b")), ("rrif", re.compile(r"\brrif\b")), ("lira", re.compile(r"\blira\b")),
+    ("resp", re.compile(r"\bresp\b")), ("rrif", re.compile(r"\brrif\b")), ("rdsp", re.compile(r"\brdsp\b")),
+    ("lira", re.compile(r"\b(?:lira|lrsp|lif|lrif|prif|rlif)\b")),
     ("non_registered", re.compile(r"\bnon[\s-]?reg(?:istered)?\b|\bmargin\b|\bindividual\b")),
 )
 TAX = {"tfsa": "tax-free", "fhsa": "tax-free", "rrsp": "tax-deferred", "resp": "tax-deferred",
-       "rrif": "tax-deferred", "lira": "tax-deferred", "non_registered": "taxable"}
-GENERIC_SUBTYPES = {"", "brokerage", "investment", "other"}
-CLAMP = Decimal("0.01")  # a negative cash estimate within 1% of the balance is price timing or FX: shown as 0
+       "rrif": "tax-deferred", "rdsp": "tax-deferred", "lira": "tax-deferred", "non_registered": "taxable"}
+GENERIC_SUBTYPES = {"", "brokerage", "investment", "other"}  # say nothing about the kind: "other" gets a note
+# generic brokerage subtypes whose account, with no holdings, is all cash. Not crypto or unknown subtypes: their
+# assets may simply not be reported as holdings.
+CASH_IF_EMPTY = {"brokerage", "cashmanagement", "nontaxablebrokerageaccount"}
+CLAMP = Decimal("0.01")  # a shortfall within 1% of the balance, and at most CLAMP_MAX, is price timing or FX: 0
+CLAMP_MAX = Decimal("50")
 CASH_NOTE = ("Plaid doesn't report cash for these accounts; estimated as balance minus holdings at the Bank of Canada "
              "rate. Small differences come from the broker's own FX rate and price timing.")
 FX_FAILED_NOTE = ("The Bank of Canada USD/CAD rate couldn't be fetched, so cash_estimate is omitted for accounts "
@@ -107,7 +114,8 @@ GENERIC_NOTE = ("account_kind 'other': the institution reports only a generic ty
 AMBIGUOUS_NOTE = "account_kind 'other': the account name mentions more than one account type."
 HIDDEN_NOTE = "hidden_empty counts accounts with a zero balance and no holdings; detail='full' lists them."
 SUMMARY_NOTE = ("by_kind is from balances. cash_total_estimate = chequing and cash-account balances plus the cash "
-                "estimated in investment accounts; invested_total = investment balances minus that cash.")
+                "estimated in investment accounts; invested_total = investment balances minus that cash. CSV-only "
+                "balances are holdings values, so they count as invested, not cash.")
 # ISO 10383 codes of US exchanges. A security listed on one of these in USD is priced in USD, whatever the holding's
 # label says. OTC (OOTC) is left out on purpose: Plaid matches TSX-listed ETFs to US OTC tickers, and those holdings
 # really are in the institution's currency.
@@ -619,14 +627,18 @@ def _bucket(account_type: str) -> str:
 
 def _keyword_kinds(text: str | None) -> set[str]:
     words = (text or "").lower().replace("_", " ")
-    return {kind for kind, pattern in NAME_KINDS if pattern.search(words)}
+    kinds = {kind for kind, pattern in NAME_KINDS if pattern.search(words)}
+    if len(kinds) > 1:  # a registered plan beats "individual" or "margin": "Individual TFSA" is a TFSA
+        kinds.discard("non_registered")
+    return kinds
 
 
 def account_kind(subtype: str | None, name: str | None, no_holdings: bool = False) -> tuple[str, str, str | None]:
     """(account_kind, kind_basis, note) from the reported subtype, then name keywords, then "no holdings".
 
     no_holdings is True only for an investment account whose holdings were loaded and are empty. A generic subtype
-    (such as brokerage) with an uninformative name is "other" with a note, never a guess.
+    (such as brokerage) with an uninformative name is "other" with a note, never a guess. Only a generic brokerage
+    subtype with no holdings is "cash"; kind_basis is "none" when no subtype was reported.
     """
     sub = _norm(subtype or "")
     if sub in SUBTYPE_KINDS:
@@ -639,9 +651,9 @@ def account_kind(subtype: str | None, name: str | None, no_holdings: bool = Fals
         return from_name.pop(), "name", None
     if len(from_name) > 1:
         return "other", "name", AMBIGUOUS_NOTE
-    if no_holdings:
+    if no_holdings and sub in CASH_IF_EMPTY:
         return "cash", "no holdings", None
-    return "other", "subtype", GENERIC_NOTE if sub in GENERIC_SUBTYPES else None
+    return "other", "subtype" if sub else "none", GENERIC_NOTE if sub in GENERIC_SUBTYPES else None
 
 
 class _FxOnce:
@@ -687,7 +699,7 @@ def _cash_estimate(balance: Decimal, currency: str, positions: list[dict], fx: _
         total += value * rate.rate if cur == "USD" else value / rate.rate
     cash = balance - total
     if cash < 0:
-        if -cash <= abs(balance) * CLAMP:
+        if -cash <= min(abs(balance) * CLAMP, CLAMP_MAX):
             return Decimal(0)
         notes.append(NEGATIVE_NOTE)
         return None
@@ -707,12 +719,15 @@ def _derive(rows: list[dict], held: list[dict], fx_source: Callable[[], Any] | N
     for r in rows:
         mine = positions.get(r["id"], []) if r["source"] == "plaid" else []
         known = r["source"] == "plaid" and r["type"] in INVESTMENT_ACCOUNT_TYPES and r.get("_held", False)
-        kind, basis, note = account_kind(r["subtype"], r["name"], no_holdings=known and not mine)
+        # a CSV row keeps its registration type in "type" (its subtype is None)
+        reported = r["subtype"] if r["source"] == "plaid" else r["type"]
+        kind, basis, note = account_kind(reported, r["name"], no_holdings=known and not mine)
         if note:
             notes.append(note)
         balance = _dec(r["current"])
         estimate = None
-        if known and balance is not None and r["currency"]:
+        # an unrecognised account with no holdings may hold assets Plaid doesn't list (crypto): no estimate
+        if known and balance is not None and r["currency"] and (mine or kind != "other"):
             estimate = _cash_estimate(balance, r["currency"], mine, fx, notes)
             estimated = estimated or estimate is not None
         r.update(kind=kind, kind_basis=basis, tax=TAX.get(kind, "n/a"), cash_estimate=estimate, _investment=known,
@@ -966,10 +981,10 @@ def _kind_totals(rows: list[dict], currency: str, notes: list[str]) -> dict:
             else:
                 cash += r["cash_estimate"]
                 invested += value - r["cash_estimate"]
+        elif r["basis"] == "holdings_market_value":  # a CSV balance is a holdings value, even for a CASH account
+            invested += value
         elif r["kind"] in ("chequing", "cash"):
             cash += value
-        elif r["basis"] == "holdings_market_value":
-            invested += value
     if not values:
         return {}
     notes.append(SUMMARY_NOTE)

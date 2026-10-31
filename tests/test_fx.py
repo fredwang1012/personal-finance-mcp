@@ -1,4 +1,5 @@
 """app/fx.py: the one outbound request to the Bank of Canada, always through a fake opener here."""
+import io
 import json
 import urllib.request
 from decimal import Decimal
@@ -12,11 +13,13 @@ FIX = Path(__file__).parent / "fixtures" / "valet_fxusdcad.json"
 
 
 class FakeResponse:
-    def __init__(self, body: bytes):
-        self.body = body
+    def __init__(self, body: bytes, on_read=None):
+        self.stream, self.on_read = io.BytesIO(body), on_read
 
     def read(self, n=-1):
-        return self.body if n < 0 else self.body[:n]
+        if self.on_read:
+            self.on_read()
+        return self.stream.read(n)
 
     def __enter__(self):
         return self
@@ -26,16 +29,16 @@ class FakeResponse:
 
 
 class FakeOpener:
-    def __init__(self, body: bytes | None = None, error: Exception | None = None):
+    def __init__(self, body: bytes | None = None, error: Exception | None = None, on_read=None):
         self.body = body if body is not None else FIX.read_bytes()
-        self.error = error
+        self.error, self.on_read = error, on_read
         self.requests: list[tuple[urllib.request.Request, float]] = []
 
     def __call__(self, request, timeout):
         self.requests.append((request, timeout))
         if self.error:
             raise self.error
-        return FakeResponse(self.body)
+        return FakeResponse(self.body, self.on_read)
 
 
 class Clock:
@@ -61,10 +64,47 @@ def test_parse_recorded_valet_shape():
     {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": "-1.25"}}]},
     {"observations": [{"d": "<b>", "FXUSDCAD": {"v": "1.25"}}]},
     {"observations": "nope"},
+    {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": 1.25}}]},  # a number, not Valet's string
+    {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": "1.25e0"}}]},
+    {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": "1.123456789"}}]},  # more than 8 decimals
+    {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": " 1.25"}}]},
+    {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": "3.5000"}}]},  # outside 0.5 to 3
+    {"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": "0.4000"}}]},
 ])
 def test_parse_rejects_bad_shapes(payload):
     with pytest.raises(ValueError):
         fx.parse(payload)
+
+
+def test_rate_is_quantized_to_four_decimals():
+    rate = fx.parse({"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": "1.23456789"}}]})
+    assert format(rate.rate, "f") == "1.2346"
+
+
+def test_giant_digit_rate_is_rejected():
+    giant = "1." + "2" * 60000  # inside the range, but it would bloat every response
+    body = json.dumps({"observations": [{"d": "2024-01-02", "FXUSDCAD": {"v": giant}}]}).encode()
+    with pytest.raises(ValueError):
+        fx.parse(json.loads(body))
+    with pytest.raises(ValueError):  # too large for the response cap as well
+        fx.fetch(opener=FakeOpener(body))
+
+
+def test_slow_response_hits_the_total_deadline():
+    clock = iter(range(0, 1000, 5))  # each read takes 5 s
+    opener = FakeOpener(b" " * (fx.CHUNK * 3) + FIX.read_bytes())
+    with pytest.raises(TimeoutError):
+        fx.fetch(opener=opener, clock=lambda: next(clock))
+
+
+def test_real_opener_ignores_environment_proxies(monkeypatch):
+    built = []
+    monkeypatch.setattr(fx.urllib.request, "build_opener", lambda *h: built.append(h) or pytest.fail("built"))
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    with pytest.raises(pytest.fail.Exception):
+        fx._open_direct(urllib.request.Request(fx.VALET_URL), 5)
+    proxies = [h for h in built[0] if isinstance(h, urllib.request.ProxyHandler)]
+    assert len(proxies) == 1 and proxies[0].proxies == {}
 
 
 def test_fetch_is_a_plain_get_to_the_fixed_url_with_timeout():

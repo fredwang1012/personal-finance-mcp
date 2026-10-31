@@ -35,21 +35,26 @@ The server works out what Wealthsimple's raw Plaid data means, so Claude doesn't
   So each Plaid investment account gets `cash_estimate` = balance minus holdings. USD holdings are first converted at
   the Bank of Canada rate, shown once per response as `fx` with its date. The estimate is omitted, with a note, when
   the rate can't be fetched, a holding is in another currency, or holdings exceed the balance by more than 1% (stale
-  or incomplete holdings). A smaller shortfall is FX and price timing, shown as 0. An investment account with no
-  holdings is all cash.
+  or incomplete holdings). A smaller shortfall (at most 1% and $50) is FX and price timing, shown as 0. A generic
+  brokerage account with no holdings is all cash; an unrecognised one (such as crypto) gets no estimate, since its
+  assets may simply not be listed.
 - **Account kind.** Plaid's subtype is often generic: `brokerage` covers the FHSA and non-registered accounts. So
-  `account_kind` (tfsa, fhsa, rrsp, resp, rrif, lira, non_registered, cash, chequing, credit_card, line_of_credit or
-  other) comes from the subtype, then from keywords in the name (FHSA, TFSA, RRSP, non-registered, margin,
-  individual), then `cash` for an investment account with no holdings. `kind_basis` says which, and `tax` gives the
+  `account_kind` (tfsa, fhsa, rrsp, resp, rrif, rdsp, lira, non_registered, cash, chequing, credit_card,
+  line_of_credit or other) comes from the subtype (for CSV accounts, the export's account type), then from keywords
+  in the name (FHSA, TFSA, RRSP, non-registered, margin, individual; a registered plan wins, so "Individual TFSA"
+  is a TFSA), then `cash` for a generic brokerage account with no holdings. Locked-in plans (LRSP, LIF, LRIF, PRIF,
+  RLIF) are reported as lira. `kind_basis` says which (`none` when no subtype was reported), and `tax` gives the
   treatment (tax-free, tax-deferred, taxable or n/a). A generic subtype with an uninformative name stays `other`;
   the kind is never guessed.
 - **Summary.** `by_kind` is from balances. `cash_total_estimate` is chequing and cash-account balances plus the
-  investment accounts' cash estimates; `invested_total` is investment balances minus those estimates.
+  investment accounts' cash estimates; `invested_total` is investment balances minus those estimates. CSV-only
+  balances are holdings values, so they count as invested.
 
 **Outbound requests.** Besides Plaid, the server makes one request: a GET to
 `https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?recent=1` for the public USD/CAD rate (Bank of Canada
-Valet API, no key). It carries no personal data, only goes to that allow-listed host, refuses redirects, times out
-after 5 seconds and is cached in memory for 12 hours. It is made only when an estimate needs a conversion. Set
+Valet API, no key). It carries no personal data, only goes to that allow-listed host, ignores proxy settings,
+refuses redirects, gives up after 8 seconds, accepts only a rate with at most 8 decimals between 0.5 and 3, and is
+cached in memory for 12 hours. It is made only when an estimate needs a conversion. Set
 `FX_ENABLED=false` to turn it off; estimates that need it are then omitted with a note.
 
 Plaid responses are cached in memory for 5 minutes per process, keyed by item, a digest of its access token and
