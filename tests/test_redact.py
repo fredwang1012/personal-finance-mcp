@@ -18,3 +18,9 @@ def test_modules_share_one_implementation():
     for module in (cli, csvimport, tools):
         assert module.clean_text is redact.clean_text
     assert not hasattr(tools, "_short") and not hasattr(csvimport, "_text")
+
+
+def test_clean_text_replaces_links_and_emails():
+    out = redact.clean_text("see https://evil.example/x?a=1 or www.evil.example, mail bob.smith+x@evil.co.uk now")
+    assert out == "see [link] or [link] mail [email] now"
+    assert redact.cut("x" * 100, 60) == "x" * 59 + "…" and redact.cut("short", 60) == "short"

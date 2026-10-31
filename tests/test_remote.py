@@ -22,8 +22,7 @@ RESOURCE = PUBLIC + "/mcp"
 CB = "https://claude.ai/api/mcp/auth_callback"
 OWNER, STRANGER = 4242, 9999
 KEY = b"k" * 64
-TOOLS = {"list_accounts", "get_balances", "get_holdings", "get_transactions", "get_investment_transactions",
-         "net_worth", "allocation", "item_health"}
+TOOLS = {"accounts", "holdings", "transactions", "summary", "health"}
 MCP_HEADERS = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
 
 
@@ -168,7 +167,7 @@ def test_owner_login_end_to_end(remote):
     client_id, tokens = full_login(client, provider)
     assert tokens["token_type"] == "Bearer" and tokens["expires_in"] == 3600 and tokens["scope"] == "finance.read"
     assert tokens["refresh_token"]
-    r = rpc(client, tokens["access_token"], "tools/call", {"name": "list_accounts", "arguments": {}})
+    r = rpc(client, tokens["access_token"], "tools/call", {"name": "accounts", "arguments": {}})
     assert r.status_code == 200
     assert tool_payload(r)["accounts"][0]["name"] == "TFSA"
     # stored only as digests: no raw token, code or client secret in the database file
@@ -366,7 +365,8 @@ def test_tools_list_over_http_is_read_only_and_complete(remote):
     for t in listed:
         a = t["annotations"]
         assert (a["readOnlyHint"], a["destructiveHint"], a["idempotentHint"], a["openWorldHint"]) == (
-            True, False, True, False), t["name"]
+            True, False, True, True), t["name"]
+        assert "outputSchema" not in t, t["name"]  # one text block per result; nothing is sent twice
     assert rpc(client, tokens["access_token"], "resources/list").json()["result"]["resources"] == []
     assert rpc(client, tokens["access_token"], "prompts/list").json()["result"]["prompts"] == []
 
@@ -402,8 +402,13 @@ def test_markers_never_reach_http_output(remote, monkeypatch):
     blob = ""
     for i, name in enumerate(sorted(TOOLS)):
         blob += rpc(client, tokens["access_token"], "tools/call", {"name": name, "arguments": {}}, rid=i + 2).text
-    blob += rpc(client, tokens["access_token"], "tools/call",
-                {"name": "get_holdings", "arguments": {"account": "tfsa"}}, rid=50).text
+    for i, (name, args) in enumerate([("holdings", {"account": "tfsa", "detail": "full"}),
+                                      ("accounts", {"detail": "full"}),
+                                      ("transactions", {"days": 730, "limit": 200, "detail": "full"}),
+                                      ("summary", {"currency": "USD"})]):
+        r = rpc(client, tokens["access_token"], "tools/call", {"name": name, "arguments": args}, rid=50 + i)
+        assert r.status_code == 200 and "error" not in tool_payload(r), name
+        blob += r.text
     assert "BAD" in blob  # the Plaid error code still surfaces, so the hostile fake really ran
     for marker in FORBIDDEN + ["987654321098", "access-sandbox-zzz-123"]:
         assert marker not in blob, marker
@@ -438,14 +443,14 @@ def test_audit_log_has_tool_names_and_client_only(remote, tmp_path):
     client, provider, _ = remote
     client_id, tokens = full_login(client, provider)
     rpc(client, tokens["access_token"], "tools/call",
-        {"name": "get_holdings", "arguments": {"account": "ARGMARKER-1234"}})
-    rpc(client, tokens["access_token"], "tools/call", {"name": "list_accounts", "arguments": {}}, rid=2)
+        {"name": "holdings", "arguments": {"account": "ARGMARKER-1234"}})
+    rpc(client, tokens["access_token"], "tools/call", {"name": "accounts", "arguments": {}}, rid=2)
     rpc(client, tokens["access_token"], "tools/call", {"name": "NAMEMARKER", "arguments": {}}, rid=3)
     text = (tmp_path / "remote" / "audit.log").read_text()
     lines = [json.loads(line) for line in text.splitlines()]
     calls = [line for line in lines if line["event"] == "tool_call"]
     assert [(c["tool"], c["client"]) for c in calls] == [
-        ("get_holdings", client_id), ("list_accounts", client_id), ("unknown", client_id)]
+        ("holdings", client_id), ("accounts", client_id), ("unknown", client_id)]
     assert all(set(c) == {"ts", "event", "tool", "client"} for c in calls)
     for secret in ("ARGMARKER", "NAMEMARKER", "TFSA", "1000.5", tokens["access_token"], tokens["refresh_token"],
                    "code_verifier", "gh-code"):

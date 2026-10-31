@@ -1,6 +1,6 @@
 # Remote connector: claude.ai, iPhone and iPad
 
-This runs the same eight read-only tools on a small Linux VM so that Claude on the web, iOS and iPadOS can use them.
+This runs the same five read-only tools on a small Linux VM so that Claude on the web, iOS and iPadOS can use them.
 claude.ai calls custom connectors from Anthropic's cloud, so the server must be reachable over public HTTPS and
 protected by OAuth.
 

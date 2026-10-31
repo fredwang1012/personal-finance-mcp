@@ -73,3 +73,13 @@ def isolated_settings(monkeypatch, tmp_path):
         original_init(self, env, country_codes, client_id=client_id, secret=secret)
 
     monkeypatch.setattr(plaid_client.RealPlaid, "__init__", guarded_init)
+
+
+@pytest.fixture(autouse=True)
+def fresh_plaid_cache():
+    """The server's Plaid cache lives for the process; no test may see another test's cached responses."""
+    from app import server
+
+    server.CACHE.clear()
+    yield
+    server.CACHE.clear()
