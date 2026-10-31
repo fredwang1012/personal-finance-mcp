@@ -4,7 +4,7 @@ Guard: the switch is honoured only when PYTEST_CURRENT_TEST is set in the enviro
 directory inside pytest's temporary tree, that is under the system temp dir and below a folder named
 `pytest-of-<user>`. The real data dir (repo `data/`) never qualifies, so setting the variable by accident in a real config does nothing except print a warning to stderr.
 In fake mode the keyring is replaced by an in-memory one before anything reads it, so the OS keychain is never
-opened, and Plaid is replaced by a fake that never touches the network.
+opened, and Plaid and the Bank of Canada FX source are replaced by fakes that never touch the network.
 """
 import os
 import tempfile
@@ -52,7 +52,7 @@ class MemoryKeyring(KeyringBackend):
 
 
 class FakePlaid:
-    """One TFSA with one ETF holding and one buy; enough to exercise every tool."""
+    """One TFSA with two holdings (one US-listed) and one buy; enough to exercise every tool."""
 
     def __init__(self, *_args):
         pass
@@ -65,9 +65,15 @@ class FakePlaid:
         }]}
 
     def investments_holdings_get(self, token):
-        return {"securities": [{"security_id": "s1", "name": "Fake ETF", "ticker_symbol": "FAKE", "type": "etf"}],
+        # s2 is US-listed but labelled CAD, as the institution does, so a cash estimate needs the (fake) FX rate
+        return {"securities": [{"security_id": "s1", "name": "Fake ETF", "ticker_symbol": "FAKE", "type": "etf"},
+                               {"security_id": "s2", "name": "Fake US Corp", "ticker_symbol": "FAKEUS",
+                                "type": "equity", "market_identifier_code": "XNAS", "iso_currency_code": "USD"}],
                 "holdings": [{"account_id": "fake-account", "security_id": "s1", "quantity": 10,
-                              "institution_price": 123.456, "institution_value": 1234.56, "cost_basis": 1000,
+                              "institution_price": 100, "institution_value": 1000, "cost_basis": 900,
+                              "iso_currency_code": "CAD"},
+                             {"account_id": "fake-account", "security_id": "s2", "quantity": 2,
+                              "institution_price": 50, "institution_value": 100, "cost_basis": 90,
                               "iso_currency_code": "CAD"}]}
 
     def investments_transactions_get(self, token, start, end):
@@ -80,6 +86,15 @@ class FakePlaid:
         today = datetime.combine(date.today(), time(), tzinfo=timezone.utc)
         return {"item": {"institution_name": "Wealthsimple", "products": ["investments", "transactions"]},
                 "status": {"investments": {"last_successful_update": today}}}
+
+
+def fake_fx():
+    """A fixed, made-up USD/CAD rate, so the server never calls the Bank of Canada in test mode."""
+    from decimal import Decimal
+
+    from app import fx
+
+    return fx.FxSource(fetcher=lambda: fx.Rate(Decimal("1.25"), "2024-01-02"))
 
 
 def install(env: str) -> None:

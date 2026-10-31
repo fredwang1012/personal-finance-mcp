@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from app import testmode
+from app import testmode, tools
 from app.config import ROOT
 
 TIMEOUT = 20  # seconds per response
@@ -115,9 +115,12 @@ def test_stdio_server_end_to_end(client, tmp_path):
     assert chr(10) not in text
     payload = json.loads(text)
     assert payload == {"accounts": [{
-        "id": payload["accounts"][0]["id"], "name": "TFSA", "type": "tfsa", "last4": "0001", "currency": "CAD",
-        "balance": "1234.56",
-    }]}  # no notes key: no keychain failure note, so the in-memory keyring was used
+        "id": payload["accounts"][0]["id"], "name": "TFSA", "account_kind": "tfsa", "kind_basis": "subtype",
+        "tax": "tax-free", "last4": "0001", "currency": "CAD", "balance": "1234.56", "cash_estimate": "109.56",
+    }], "fx": {"pair": "USDCAD", "rate": "1.25", "date": "2024-01-02", "source": "Bank of Canada"},
+        "notes": [tools.US_LISTED_NOTE, tools.CASH_NOTE]}
+    # 1234.56 - 1000 CAD - 100 USD x 1.25: the fake rate was used, so the Bank of Canada was never called; and there is
+    # no keychain failure note, so the in-memory keyring was used
     for name, args in [("holdings", {"detail": "full"}), ("transactions", {"detail": "full"}), ("summary", {}),
                        ("health", {})]:
         result = client.request("tools/call", {"name": name, "arguments": args})["result"]
@@ -147,6 +150,8 @@ def test_stdio_hostile_plaid_text_never_reaches_output(tmp_path):
             blob += result["content"][0]["text"]
         assert "Wealthsimple" not in blob or "WS" in blob  # the hostile fake really ran
         assert '"security_type":"other"' in blob and "[link]" in blob and "[email]" in blob
+        # the derived fields ran on hostile data too
+        assert '"account_kind":"tfsa"' in blob and '"cash_estimate"' in blob and '"by_kind"' in blob
         for marker in HOSTILE_MARKERS:
             assert marker not in blob, marker
     finally:

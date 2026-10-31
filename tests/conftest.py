@@ -83,3 +83,24 @@ def fresh_plaid_cache():
     server.CACHE.clear()
     yield
     server.CACHE.clear()
+
+
+class RealNetworkInTests(RuntimeError):
+    pass
+
+
+FAKE_FX_RATE = "1.25"  # made up; tests that need another rate build their own source
+
+
+@pytest.fixture(autouse=True)
+def no_real_fx(monkeypatch):
+    """No test reaches the Bank of Canada: the real opener raises, and the server's FX source is a fake."""
+    from decimal import Decimal
+
+    from app import fx, server
+
+    def no_network(*_args, **_kwargs):
+        raise RealNetworkInTests("tests must use a fake FX opener")
+
+    monkeypatch.setattr(fx, "_urlopen", no_network)
+    monkeypatch.setattr(server, "FX", fx.FxSource(fetcher=lambda: fx.Rate(Decimal(FAKE_FX_RATE), "2024-01-02")))

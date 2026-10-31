@@ -411,10 +411,12 @@ def test_markers_never_reach_http_output(remote, monkeypatch, hostile):
         r = rpc(client, tokens["access_token"], "tools/call", {"name": name, "arguments": args}, rid=50 + i)
         assert r.status_code == 200 and "error" not in tool_payload(r), name
         blob += r.text
+    assert '\\"account_kind\\":' in blob  # the derived fields were scanned too
     if hostile is HostilePlaid:
         assert "BAD" in blob  # the Plaid error code still surfaces, so the hostile fake really ran
     else:
         assert '\\"security_type\\":\\"other\\"' in blob  # hostile holdings were processed, not refused
+        assert '\\"by_kind\\":' in blob and '\\"cash_estimate\\":' in blob
     for marker in FORBIDDEN + ["987654321098", "access-sandbox-zzz-123", "evil.example"]:
         assert marker not in blob, marker
 
