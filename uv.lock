@@ -358,6 +358,7 @@ name = "personal-finance-mcp"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "keyring" },
     { name = "mcp" },
     { name = "plaid-python" },
@@ -371,6 +372,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=50.0" },
     { name = "keyring", specifier = ">=25.7" },
     { name = "mcp", specifier = ">=2.3" },
     { name = "plaid-python", specifier = ">=46.0" },

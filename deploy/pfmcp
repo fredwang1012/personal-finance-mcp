@@ -2,7 +2,7 @@
 # Admin wrapper for personal-finance-mcp on the server, installed as /usr/local/bin/pfmcp. Run with sudo.
 #
 #   sudo pfmcp list-clients | approve-client FP | revoke-client FP   (run as the service user)
-#   sudo pfmcp status | import-bundle | link --port N | unlink ...    (run as root: systemd-creds needs the host key)
+#   sudo pfmcp status | bundle-key | import-bundle | link --port N | unlink ...  (root: systemd-creds needs the host key)
 set -euo pipefail
 
 APP=/opt/personal-finance-mcp
@@ -18,10 +18,10 @@ cd "$APP"
 case "${1:-}" in
     list-clients|approve-client|revoke-client)
         exec runuser -u pfmcp -- "$APP/.venv/bin/python" -m app.cli "$@" ;;
-    status|import-bundle|link|unlink)
+    status|bundle-key|import-bundle|link|unlink)
         exec "$APP/.venv/bin/python" -m app.cli "$@" ;;
     *)
-        echo "usage: sudo pfmcp list-clients | approve-client FP | revoke-client FP | status | import-bundle |" \
+        echo "usage: sudo pfmcp list-clients | approve-client FP | revoke-client FP | status | bundle-key | import-bundle |" \
              "link --port N | unlink [ITEM]" >&2
         exit 2 ;;
 esac

@@ -8,6 +8,7 @@ dependencies = [
     "plaid-python>=46.0",
     "keyring>=25.7",
     "pydantic-settings>=2.16",
+    "cryptography>=50.0",  # already locked via mcp (pyjwt[crypto]); used directly by app/bundle.py
 ]
 
 [dependency-groups]

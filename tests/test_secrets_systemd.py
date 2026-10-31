@@ -106,27 +106,64 @@ class Tty(io.StringIO):
         return True
 
 
-def test_bundle_moves_keys_and_tokens_from_keychain_to_systemd(monkeypatch, tmp_path, capsys):
-    secrets.set_plaid_keys("production", "cid-3", "sec-3")
-    secrets.set_access_token("production", "item-X", "access-production-X")
-    assert cli.export_bundle("production", Tty()) == 1  # never to a terminal
-    out = Pipe()
-    assert cli.export_bundle("production", out) == 0
-    err = capsys.readouterr().err
-    assert "access-production-X" not in err and "item-X" not in err and "sec-3" not in err
+MARKERS = ("access-production-XMARK", "item-XMARK", "sec-XMARK", "cid-XMARK")
 
+
+def test_bundle_is_sealed_to_the_server_key_and_round_trips(monkeypatch, tmp_path, capsys):
     fake = FakeSystemdCreds()
-    monkeypatch.setattr(settings, "secrets_backend", "systemd")
-    monkeypatch.setattr(settings, "credstore_dir", tmp_path / "credstore")
-    monkeypatch.setattr(secrets, "backend", lambda: secrets.SystemdCreds(settings.credstore_dir, None, run=fake))
-    assert cli.import_bundle("sandbox", Pipe(out.getvalue())) == 1  # environment mismatch
-    assert cli.import_bundle("production", Tty(out.getvalue())) == 1
-    assert cli.import_bundle("production", Pipe("not json")) == 1
-    assert cli.import_bundle("production", Pipe(out.getvalue())) == 0
+    keyring_backend = secrets.backend
+
+    def server_side():
+        monkeypatch.setattr(settings, "secrets_backend", "systemd")
+        monkeypatch.setattr(settings, "credstore_dir", tmp_path / "credstore")
+        monkeypatch.setattr(secrets, "backend", lambda: secrets.SystemdCreds(settings.credstore_dir, None, run=fake))
+
+    def laptop_side():
+        monkeypatch.setattr(settings, "secrets_backend", "keyring")
+        monkeypatch.setattr(secrets, "backend", keyring_backend)
+
+    server_side()
+    assert cli.bundle_key() == 0
+    public = capsys.readouterr().out.strip().splitlines()[-1]
+    assert public.startswith("pfmcp-pub-1:")
+    assert (tmp_path / "credstore" / cli.BUNDLE_KEY).exists()
+
+    laptop_side()
+    secrets.set_plaid_keys("production", "cid-XMARK", "sec-XMARK")
+    secrets.set_access_token("production", "item-XMARK", "access-production-XMARK")
+    assert cli.export_bundle("production", None, Tty()) == 1  # no --to: refuses, writes nothing
+    assert capsys.readouterr().out == ""
+    out = Tty()  # a terminal is fine now: only ciphertext is written
+    assert cli.export_bundle("production", public, out) == 0
+    sealed = out.getvalue()
+    assert sealed.startswith("pfmcp-sealed-1:")
     printed = capsys.readouterr()
-    assert "access-production-X" not in printed.out + printed.err
-    assert secrets.get_client_id() == "cid-3"
-    assert secrets.get_access_token("production", "item-X") == "access-production-X"
+    for marker in MARKERS:
+        assert marker not in sealed and marker not in printed.out + printed.err
+
+    server_side()
+    assert cli.import_bundle("production", Pipe("pfmcp-sealed-1:AAAA")) == 1  # damaged
+    assert cli.import_bundle("sandbox", Pipe(sealed)) == 1  # environment mismatch
+    assert cli.import_bundle("production", Tty(sealed)) == 0  # pasted at a terminal also works
+    printed = capsys.readouterr()
+    assert not [m for m in MARKERS if m in printed.out + printed.err]
+    assert secrets.get_client_id() == "cid-XMARK"
+    assert secrets.get_access_token("production", "item-XMARK") == "access-production-XMARK"
+    # the one-time key is gone, so the same ciphertext cannot be imported again
+    assert not (tmp_path / "credstore" / cli.BUNDLE_KEY).exists()
+    assert cli.import_bundle("production", Pipe(sealed)) == 1
+
+
+def test_sealed_bundle_needs_the_matching_key():
+    from app import bundle
+
+    _, public = bundle.generate_keypair()
+    other_private, _ = bundle.generate_keypair()
+    sealed = bundle.seal(public, b"secret-XMARK")
+    with pytest.raises(bundle.BundleError, match="wrong key"):
+        bundle.open_sealed(other_private, sealed)
+    with pytest.raises(bundle.BundleError):
+        bundle.seal("not-a-key", b"x")
 
 
 def test_import_bundle_refused_on_keychain_backend(capsys):

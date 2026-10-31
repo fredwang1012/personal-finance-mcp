@@ -1,5 +1,6 @@
 """Command line: python -m app.cli set-plaid-keys | status | link [--update ITEM_SHORT_ID] | unlink | import-csv
-| serve-http | set-remote-secrets | export-bundle | import-bundle."""
+| serve-http | set-remote-secrets | bundle-key | export-bundle | import-bundle
+| list-clients | approve-client | revoke-client."""
 import argparse
 import getpass
 import json
@@ -228,12 +229,33 @@ def set_remote_secrets(rotate_signing_key: bool = False) -> int:
     return 0
 
 
-def export_bundle(env: str, out=None) -> int:
-    """Write this environment's Plaid keys and access tokens as one JSON line, for piping straight into
-    `ssh ... import-bundle`. Refuses to write to a terminal, so the secrets never appear on screen."""
+BUNDLE_KEY = "bundle_private_key"
+
+
+def bundle_key() -> int:
+    """Server: make a one-time keypair for import-bundle; store the private half, print only the public half."""
+    from app.bundle import generate_keypair
+
+    private, public = generate_keypair()
+    try:
+        secrets._set(BUNDLE_KEY, private)
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print("Public key for export-bundle --to (safe to copy; it is deleted again after a successful import):")
+    print(public)
+    return 0
+
+
+def export_bundle(env: str, to: str | None, out=None) -> int:
+    """Laptop: write this environment's Plaid keys and access tokens sealed to the server's public key.
+    The output is ciphertext only, so it is harmless on a terminal or in a file."""
+    from app.bundle import BundleError, seal
+
     out = out or sys.stdout
-    if out.isatty():
-        print("Refusing to print secrets to a terminal. Pipe this into ssh; see docs/REMOTE.md.", file=sys.stderr)
+    if not to:
+        print("export-bundle needs --to KEY, the public key printed by `bundle-key` on the server. It never writes "
+              "the secrets unencrypted.", file=sys.stderr)
         return 1
     try:
         items = {i: secrets.get_access_token(env, i) for i in secrets.list_item_ids(env)}
@@ -243,26 +265,43 @@ def export_bundle(env: str, out=None) -> int:
         # not the exception text: per-item messages name the keychain entry, which contains the raw item id
         print("Export failed: a Plaid key or access token is missing. Run status to check.", file=sys.stderr)
         return 1
-    out.write(json.dumps(bundle) + "\n")
+    try:
+        sealed = seal(to, json.dumps(bundle).encode())
+    except BundleError as exc:
+        print(f"Export failed: {exc}.", file=sys.stderr)
+        return 1
+    out.write(sealed + "\n")
     out.flush()
-    print(f"Exported Plaid keys and {len(items)} item(s) for '{env}': "
+    print(f"Sealed Plaid keys and {len(items)} item(s) for '{env}': "
           f"{', '.join(short_hash(i) for i in items) or 'none'}.", file=sys.stderr)
     return 0
 
 
 def import_bundle(env: str, inp=None) -> int:
-    """Read an export-bundle line from stdin and store it in the configured backend (systemd on the server)."""
+    """Server: read a sealed bundle (pipe or paste), decrypt it with the bundle-key private half and store it."""
+    from app.bundle import BundleError, open_sealed
+
     inp = inp or sys.stdin
     if settings.secrets_backend != "systemd":
         print("import-bundle is for the server (SECRETS_BACKEND=systemd).", file=sys.stderr)
         return 1
-    if inp.isatty():
-        print("import-bundle reads from a pipe, not the keyboard; see docs/REMOTE.md.", file=sys.stderr)
-        return 1
-    raw = inp.read(MAX_BUNDLE + 1)
     try:
-        bundle = json.loads(raw) if len(raw) <= MAX_BUNDLE else None
-    except json.JSONDecodeError:
+        private = secrets.backend().get(BUNDLE_KEY)
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if not private:
+        print("No bundle key here. Run `bundle-key` first and export with its public key.", file=sys.stderr)
+        return 1
+    raw = inp.readline(MAX_BUNDLE + 1)
+    try:
+        if len(raw) > MAX_BUNDLE:
+            raise BundleError("input too large")
+        bundle = json.loads(open_sealed(private, raw))
+    except BundleError as exc:
+        print(f"Nothing stored: {exc}.", file=sys.stderr)
+        return 1
+    except (json.JSONDecodeError, UnicodeDecodeError):
         bundle = None
     ok = (isinstance(bundle, dict) and bundle.get("format") == BUNDLE_FORMAT
           and all(isinstance(bundle.get(k), str) and bundle.get(k) for k in ("env", "plaid_client_id", "plaid_secret"))
@@ -278,11 +317,12 @@ def import_bundle(env: str, inp=None) -> int:
         secrets.set_plaid_keys(env, bundle["plaid_client_id"], bundle["plaid_secret"])
         for item_id, token in bundle["items"].items():
             secrets.set_access_token(env, item_id, token)
+        secrets._delete(BUNDLE_KEY)  # one-time key: a copy of the ciphertext is useless from now on
     except secrets.MissingSecret as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"Stored Plaid keys and {len(bundle['items'])} item(s) for '{env}': "
-          f"{', '.join(short_hash(i) for i in bundle['items']) or 'none'}. "
+          f"{', '.join(short_hash(i) for i in bundle['items']) or 'none'}. Deleted the one-time bundle key. "
           "Restart the service: sudo systemctl restart personal-finance-mcp")
     return 0
 
@@ -360,8 +400,10 @@ def main(argv: list[str] | None = None) -> int:
     http_parser.add_argument("--port", type=int, help="port on 127.0.0.1 (default: HTTP_PORT setting, 8765)")
     remote_parser = sub.add_parser("set-remote-secrets", help="store the GitHub client secret and a signing key (keychain)")
     remote_parser.add_argument("--rotate-signing-key", action="store_true", help="replace the signing key")
-    sub.add_parser("export-bundle", help="write Plaid keys and tokens as JSON to a pipe (for moving them to the server)")
-    sub.add_parser("import-bundle", help="read an export bundle from a pipe into systemd credentials (server, as root)")
+    sub.add_parser("bundle-key", help="server: make a one-time key for import-bundle and print its public half")
+    export_parser = sub.add_parser("export-bundle", help="laptop: write Plaid keys and tokens sealed to the server's key")
+    export_parser.add_argument("--to", metavar="KEY", help="public key printed by bundle-key on the server")
+    sub.add_parser("import-bundle", help="server: decrypt a sealed bundle into systemd credentials (as root)")
     sub.add_parser("list-clients", help="list OAuth clients of the remote connector (fingerprint, status, use)")
     for name, what in (("approve-client", "approve one pending OAuth client"),
                        ("revoke-client", "revoke an OAuth client and delete its tokens")):
@@ -381,8 +423,10 @@ def main(argv: list[str] | None = None) -> int:
         return remote.serve()
     if args.command == "set-remote-secrets":
         return set_remote_secrets(args.rotate_signing_key)
+    if args.command == "bundle-key":
+        return bundle_key()
     if args.command == "export-bundle":
-        return export_bundle(settings.plaid_env)
+        return export_bundle(settings.plaid_env, args.to)
     if args.command == "import-bundle":
         return import_bundle(settings.plaid_env)
     if args.command == "import-csv":
