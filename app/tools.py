@@ -8,7 +8,6 @@ Rules every tool follows:
 Amount sign convention for transactions: negative = cash out of the account, positive = cash in. Plaid reports the
 opposite for investment transactions, so its sign is flipped to match the CSV exports.
 """
-import hashlib
 import re
 import sqlite3
 from collections import defaultdict
@@ -18,8 +17,9 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from app import store
-from app.csvimport import _activity_type, _text
+from app.csvimport import _activity_type
 from app.plaid_client import PlaidAPI, PlaidError
+from app.redact import clean_text, short_hash
 
 MAX_DAYS = 730
 MAX_LIMIT = 200
@@ -36,10 +36,6 @@ FAMILIES = {
     "nonregistered": "taxable", "brokerage": "taxable", "margin": "taxable", "individual": "taxable",
     "cash": "cash", "chequing": "cash", "savings": "cash", "crypto": "crypto",
 }
-
-
-def _short(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()[:8]
 
 
 def _enum(value: Any) -> str:
@@ -64,7 +60,7 @@ def _public(row: dict) -> dict:
     return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
-def _error_note(short: str, exc: Exception, clean: Callable[[str], str] = _text) -> str:
+def _error_note(short: str, exc: Exception, clean: Callable[[str], str] = clean_text) -> str:
     if isinstance(exc, PlaidError):
         note = f"Plaid item {short} failed: {clean(exc.code)}: {clean(exc.message)}"
         if exc.code == "ITEM_LOGIN_REQUIRED":
@@ -100,13 +96,13 @@ class Backend:
 
     def clean(self, raw: Any) -> str:
         """Sanitise free text from Plaid and remove anything that looks like a token or a known id."""
-        # redact on the raw string first: _text masks digit runs, which would hide a token from exact matching
+        # redact on the raw string first: clean_text masks digit runs, which would hide a token from exact matching
         out = str(raw or "")
         for secret in sorted((*self.tokens.values(), *self.tokens, *self._pids), key=len, reverse=True):
             if secret:
                 out = out.replace(secret, "[redacted]")
         out = TOKEN_RE.sub("[redacted]", out)
-        return TOKEN_RE.sub("[redacted]", _text(out))
+        return TOKEN_RE.sub("[redacted]", clean_text(out))
 
     def close(self) -> None:
         self.conn.close()
@@ -120,7 +116,7 @@ class Backend:
         if not self.api:
             return accounts, held, txs
         for item_id, token in self.tokens.items():
-            short = _short(item_id)
+            short = short_hash(item_id)
             try:
                 raw_accounts = self.api.accounts_get(token).get("accounts", [])
                 self._pids.update(a["account_id"] for a in raw_accounts)
@@ -151,7 +147,7 @@ class Backend:
     def _csv_accounts(self) -> dict[str, dict]:
         rows = self.conn.execute("SELECT account_id, name, type, mask FROM accounts WHERE source = 'csv'").fetchall()
         return {
-            r[0]: {"id": _short(r[0]), "name": r[1], "type": r[2].lower(), "subtype": None, "mask": r[3], "source": "csv"}
+            r[0]: {"id": short_hash(r[0]), "name": r[1], "type": r[2].lower(), "subtype": None, "mask": r[3], "source": "csv"}
             for r in rows
         }
 
@@ -227,7 +223,7 @@ class Backend:
                 continue
             rows.append({
                 "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"],
-                "account_type": acct["type"], "symbol": h["symbol"], "name": _text(h["name"]),
+                "account_type": acct["type"], "symbol": h["symbol"], "name": clean_text(h["name"]),
                 "quantity": h["quantity"], "price": h["price"] or None, "market_value": h["market_value"] or None,
                 "cost_basis": h["book_value"] or None, "currency": _currency(h["currency"], notes),
                 "security_type": None,
@@ -257,7 +253,7 @@ class Backend:
             if p and (p["id"], day) in covered:
                 continue
             rows.append({
-                "date": day, "description": _text(description), "amount": amount,
+                "date": day, "description": clean_text(description), "amount": amount,
                 "currency": _currency(currency, notes),
                 "type": type_, "symbol": symbol or None, "account_id": acct["id"], "account": acct["name"],
                 "account_mask": acct["mask"], "source": source,
@@ -271,7 +267,7 @@ class Backend:
 def _plaid_account(a: dict, item_short: str, clean: Callable[[str], str], notes: list[str]) -> dict:
     b = a.get("balances") or {}
     return {
-        "id": _short(a["account_id"]), "_pid": a["account_id"], "name": clean(a.get("name") or a.get("official_name") or ""),
+        "id": short_hash(a["account_id"]), "_pid": a["account_id"], "name": clean(a.get("name") or a.get("official_name") or ""),
         "_official": clean(a.get("official_name") or ""), "type": _enum(a.get("type")).lower(),
         "subtype": _enum(a.get("subtype")).lower() or None, "mask": (a.get("mask") or "")[-4:],
         "currency": _currency(b.get("iso_currency_code") or b.get("unofficial_currency_code"), notes),
@@ -526,7 +522,7 @@ def item_health(backend: Backend) -> dict:
     notes = _start(backend)
     items = []
     for item_id, token in backend.tokens.items():
-        short = _short(item_id)
+        short = short_hash(item_id)
         if not backend.api:
             break
         try:

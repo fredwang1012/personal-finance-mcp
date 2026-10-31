@@ -13,7 +13,7 @@ from pathlib import Path
 
 from app import secrets
 from app.plaid_client import PlaidAPI, PlaidError
-from app.tools import _short
+from app.redact import short_hash
 
 PAGE = Path(__file__).parent / "static" / "link.html"
 TIMEOUT_SECONDS = 600
@@ -87,7 +87,7 @@ class LinkServer(ThreadingHTTPServer):
             if self._exchanged:
                 raise PermissionError("already exchanged")
             access_token, item_id = self.plaid.exchange_public_token(public_token)
-            short = _short(item_id)
+            short = short_hash(item_id)
             try:
                 secrets.set_access_token(self.env, item_id, access_token)
             except Exception:
@@ -166,7 +166,7 @@ class _Handler(BaseHTTPRequestHandler):
         except PlaidError as exc:
             print(f"Plaid rejected the link: {exc.code}")
             return self._send(502, b"exchange failed")
-        print(f"Linked item {_short(item_id)}. Token stored in the OS keychain.")
+        print(f"Linked item {short_hash(item_id)}. Token stored in the OS keychain.")
         self.server.stop_soon()  # before replying, so a broken pipe cannot keep the helper alive
         self._send(200, b'{"ok": true}', "application/json")
 

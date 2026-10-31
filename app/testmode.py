@@ -1,11 +1,12 @@
 """Test-only stand-ins for the end-to-end test of `python -m app.server` (PFMCP_FAKE_PLAID=1).
 
-Guard: the switch is honoured only when DATA_DIR resolves to a directory inside pytest's temporary tree, that is
-under the system temp dir and below a folder named `pytest-of-<user>`. The real data dir (repo `data/`) never
-qualifies, so setting the variable by accident in a real config does nothing except print a warning to stderr.
+Guard: the switch is honoured only when PYTEST_CURRENT_TEST is set in the environment and DATA_DIR resolves to a
+directory inside pytest's temporary tree, that is under the system temp dir and below a folder named
+`pytest-of-<user>`. The real data dir (repo `data/`) never qualifies, so setting the variable by accident in a real config does nothing except print a warning to stderr.
 In fake mode the keyring is replaced by an in-memory one before anything reads it, so the OS keychain is never
 opened, and Plaid is replaced by a fake that never touches the network.
 """
+import os
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -22,6 +23,8 @@ FAKE_TOKEN = "access-sandbox-fake-token"
 
 
 def allowed(data_dir: Path) -> bool:
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
     try:
         resolved = Path(data_dir).resolve()
         temp = Path(tempfile.gettempdir()).resolve()

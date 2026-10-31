@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 
 from app import secrets, store, tools
 from app.config import settings
+from app.redact import short_hash
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 
@@ -62,7 +63,7 @@ def open_backend() -> tools.Backend:
                     tokens[item_id] = secrets.get_access_token(env, item_id)
                 except secrets.MissingSecret:
                     # the exception text names the keychain entry, which contains the raw item id
-                    notes.append(f"Plaid item {tools._short(item_id)} has no stored access token. Run: {secrets.LINK_CMD}")
+                    notes.append(f"Plaid item {short_hash(item_id)} has no stored access token. Run: {secrets.LINK_CMD}")
             if tokens:
                 api = plaid_factory(settings)
     except secrets.MissingSecret:
@@ -143,7 +144,7 @@ def main() -> None:
             testmode.install(settings.plaid_env)
             plaid_factory = testmode.FakePlaid
         else:  # stdout carries the protocol, so the warning goes to stderr
-            print("PFMCP_FAKE_PLAID ignored: DATA_DIR is not a pytest temp directory.", file=sys.stderr)
+            print("PFMCP_FAKE_PLAID ignored: not running under pytest with a pytest temp DATA_DIR.", file=sys.stderr)
     mcp.run("stdio")
 
 

@@ -2,7 +2,7 @@ import pytest
 
 from app import cli, secrets
 from app.plaid_client import PlaidError
-from app.tools import _short
+from app.redact import short_hash as _short
 
 ITEM_A, ITEM_B = "ITEMID-aaaa-marker", "ITEMID-bbbb-marker"
 TOKEN_A, TOKEN_B = "access-sandbox-TOKEN-a", "access-sandbox-TOKEN-b"
@@ -132,6 +132,90 @@ def test_listed_item_without_token_is_removed_locally(capsys):
 
 def test_main_parses_unlink(monkeypatch):
     seen = []
-    monkeypatch.setattr(cli, "unlink", lambda item: seen.append(item) or 0)
+    monkeypatch.setattr(cli, "unlink", lambda item, local_only=False: seen.append((item, local_only)) or 0)
     assert cli.main(["unlink"]) == 0 and cli.main(["unlink", "abcd1234"]) == 0
-    assert seen == [None, "abcd1234"]
+    assert cli.main(["unlink", "abcd1234", "--local-only"]) == 0
+    assert seen == [(None, False), ("abcd1234", False), ("abcd1234", True)]
+    with pytest.raises(SystemExit):
+        cli.main(["unlink", "--local-only"])
+
+
+def failing_delete(memory_keyring, monkeypatch):
+    def delete_password(service, username):
+        # a real backend's message can name the entry, which embeds the raw item id
+        raise RuntimeError(f"cannot delete {service}/{username}")
+
+    monkeypatch.setattr(memory_keyring, "delete_password", delete_password)
+
+
+def test_local_cleanup_failure_after_plaid_removal_is_reported_without_ids(linked, memory_keyring, monkeypatch, capsys):
+    failing_delete(memory_keyring, monkeypatch)
+    fake = FakePlaid()
+    code, prompts = run(fake, _short(ITEM_A))
+    captured = capsys.readouterr()
+    assert code == 1 and fake.removed == [TOKEN_A]
+    assert "removed at Plaid; local cleanup failed" in captured.out and "run unlink again to finish" in captured.out
+    assert "RuntimeError" in captured.out and "cannot delete" not in captured.out
+    assert_clean(captured.out + captured.err + "".join(prompts))
+
+
+def test_main_does_not_leak_a_traceback_on_cleanup_failure(linked, memory_keyring, monkeypatch, capsys):
+    failing_delete(memory_keyring, monkeypatch)
+    monkeypatch.setattr(cli, "unlink", lambda item, local_only=False: cli.run_unlink(
+        lambda: FakePlaid(), "sandbox", item, lambda _: "yes", local_only))
+    assert cli.main(["unlink", _short(ITEM_A)]) == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert_clean(captured.out + captured.err)
+
+
+def test_rerun_after_plaid_removal_cleans_up_on_invalid_access_token(linked, capsys):
+    fake = FakePlaid(PlaidError("INVALID_ACCESS_TOKEN", "the provided access token is invalid"))
+    assert run(fake, _short(ITEM_A))[0] == 0
+    assert secrets.list_item_ids("sandbox") == [ITEM_B]
+    assert not secrets.has_secret(f"access_token_sandbox_{ITEM_A}")
+    out = capsys.readouterr().out
+    assert "no longer knows" in out and "INVALID_ACCESS_TOKEN" in out
+    assert_clean(out)
+
+
+def test_local_only_deletes_locally_without_calling_plaid(linked, capsys):
+    def no_plaid():
+        raise AssertionError("--local-only must not contact Plaid")
+
+    prompts = []
+    code = cli.run_unlink(no_plaid, "sandbox", _short(ITEM_A), lambda p: prompts.append(p) or "yes", local_only=True)
+    captured = capsys.readouterr()
+    assert code == 0 and '"yes"' in prompts[0]
+    assert "does NOT revoke" in captured.out
+    assert secrets.list_item_ids("sandbox") == [ITEM_B]
+    assert not secrets.has_secret(f"access_token_sandbox_{ITEM_A}")
+    assert secrets.get_access_token("sandbox", ITEM_B) == TOKEN_B
+    assert_clean(captured.out + captured.err + "".join(prompts))
+
+
+def test_local_only_requires_typed_yes(linked, capsys):
+    assert cli.run_unlink(lambda: FakePlaid(), "sandbox", _short(ITEM_A), lambda _: "y", local_only=True) == 1
+    assert secrets.get_access_token("sandbox", ITEM_A) == TOKEN_A
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_local_only_cleanup_failure_is_reported_without_ids(linked, memory_keyring, monkeypatch, capsys):
+    failing_delete(memory_keyring, monkeypatch)
+    assert cli.run_unlink(lambda: FakePlaid(), "sandbox", _short(ITEM_A), lambda _: "yes", local_only=True) == 1
+    captured = capsys.readouterr()
+    assert "local cleanup failed" in captured.out and "removed at Plaid" not in captured.out
+    assert_clean(captured.out + captured.err)
+
+
+@pytest.mark.parametrize("local_only", [False, True])
+@pytest.mark.parametrize("error", [EOFError, KeyboardInterrupt])
+def test_interrupted_prompt_cancels(linked, capsys, error, local_only):
+    fake = FakePlaid()
+
+    def ask(_prompt):
+        raise error
+
+    assert cli.run_unlink(lambda: fake, "sandbox", _short(ITEM_A), ask, local_only=local_only) == 1
+    assert fake.removed == [] and secrets.get_access_token("sandbox", ITEM_A) == TOKEN_A
+    assert "Cancelled" in capsys.readouterr().out

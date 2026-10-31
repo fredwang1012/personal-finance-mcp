@@ -9,7 +9,8 @@ import pytest
 
 import keyring
 
-from app import link, secrets, tools
+from app import link, secrets
+from app.redact import short_hash
 from app.plaid_client import PRODUCTS, PlaidError
 
 
@@ -240,7 +241,7 @@ def test_keychain_failure_removes_orphaned_item(helper, monkeypatch, capsys):
     assert status == 500
     assert removed == ["access-sandbox-fake"]
     out = capsys.readouterr().out
-    assert tools._short("item-1") in out and "item-1" not in out and "access-sandbox-fake" not in out
+    assert short_hash("item-1") in out and "item-1" not in out and "access-sandbox-fake" not in out
     assert server.item_id is None
     thread.join(5)
     assert not thread.is_alive()

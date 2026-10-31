@@ -1,6 +1,7 @@
 """End to end: run `python -m app.server` as a subprocess and talk MCP over stdio (newline-delimited JSON-RPC).
 
-The server runs in the guarded test mode (PFMCP_FAKE_PLAID=1 with DATA_DIR inside pytest's temp tree): fake Plaid,
+The server runs in the guarded test mode (PFMCP_FAKE_PLAID=1, PYTEST_CURRENT_TEST set, DATA_DIR inside pytest's temp
+tree): fake Plaid,
 in-memory keyring. PYTHON_KEYRING_BACKEND points at keyring's always-failing backend as a second fence, so any
 attempt to open the real OS keychain would fail instead of reading it.
 """
@@ -25,12 +26,14 @@ TOOLS = {"list_accounts", "get_balances", "get_holdings", "get_transactions", "g
 
 
 class StdioClient:
-    def __init__(self, data_dir: Path, fake: bool = True):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("PLAID_", "PFMCP_"))}
+    def __init__(self, data_dir: Path, fake: bool = True, under_pytest: bool = True):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("PLAID_", "PFMCP_", "PYTEST_"))}
         env.update(DATA_DIR=str(data_dir), PLAID_ENV="sandbox", PYTHON_KEYRING_BACKEND=FAIL_KEYRING,
                    PYTHONUNBUFFERED="1")
         if fake:
             env["PFMCP_FAKE_PLAID"] = "1"
+        if under_pytest:  # the guard also wants this; passed on explicitly rather than by inheritance
+            env["PYTEST_CURRENT_TEST"] = os.environ["PYTEST_CURRENT_TEST"]
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "app.server"], cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -121,26 +124,41 @@ def test_stdio_server_end_to_end(client, tmp_path):
     assert (tmp_path / "data" / "finance.db").exists()  # the store was created in the temp DATA_DIR only
 
 
+def assert_fake_mode_off(c: StdioClient) -> None:
+    # with the failing keyring backend the server reports a keychain problem instead of fake data
+    handshake(c)
+    call = c.request("tools/call", {"name": "list_accounts", "arguments": {}})["result"]
+    payload = call.get("structuredContent") or json.loads(call["content"][0]["text"])
+    payload = payload.get("result", payload)
+    assert payload["accounts"] == []
+    assert any("Keychain or Plaid setup failed" in n for n in payload["notes"])
+    assert b"PFMCP_FAKE_PLAID ignored" in b"".join(c.stderr)  # printed before the server answers
+
+
 def test_switch_is_ignored_outside_pytest_temp():
-    # a temp dir that is not under pytest-of-<user>: fake mode must stay off, and with the failing keyring
-    # backend the server reports a keychain problem instead of fake data
+    # a temp dir that is not under pytest-of-<user>: fake mode must stay off
     with tempfile.TemporaryDirectory(prefix="pfmcp-e2e-") as tmp:
         c = StdioClient(Path(tmp) / "data")
         try:
-            handshake(c)
-            call = c.request("tools/call", {"name": "list_accounts", "arguments": {}})["result"]
-            payload = call.get("structuredContent") or json.loads(call["content"][0]["text"])
-            payload = payload.get("result", payload)
-            assert payload["accounts"] == []
-            assert any("Keychain or Plaid setup failed" in n for n in payload["notes"])
-            assert b"PFMCP_FAKE_PLAID ignored" in b"".join(c.stderr)  # printed before the server answers
+            assert_fake_mode_off(c)
         finally:
             c.close()
 
 
-def test_guard(tmp_path):
+def test_switch_is_ignored_without_pytest_marker(tmp_path):
+    # a pytest temp DATA_DIR alone is not enough: PYTEST_CURRENT_TEST must be set too
+    c = StdioClient(tmp_path / "data", under_pytest=False)
+    try:
+        assert_fake_mode_off(c)
+    finally:
+        c.close()
+
+
+def test_guard(tmp_path, monkeypatch):
     assert testmode.allowed(tmp_path)
     assert not testmode.allowed(ROOT / "data")
     assert not testmode.allowed(Path(tempfile.gettempdir()))
     assert not testmode.allowed(Path(tempfile.gettempdir()) / "elsewhere" / "pytest-of-x")
     assert not testmode.allowed(ROOT / "pytest-of-x")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    assert not testmode.allowed(tmp_path)

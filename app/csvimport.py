@@ -20,17 +20,15 @@ import csv
 import hashlib
 import io
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from app.redact import clean_text, last4
 from app.store import connect
 
 MAX_BYTES = 50 * 1024 * 1024
-MAX_TEXT = 300
-BULLETS = "•••"
 
 # canonical field -> accepted normalized header names, in priority order
 ALIASES = {
@@ -67,7 +65,6 @@ TYPE_RES = [
         ("withdrawal", r"\bwithdraw"),
     ]
 ]
-DIGIT_RUN = re.compile(r"\d(?:[ -]?\d){5,}")
 NUMBER_LIKE = re.compile(r"[\d \-]{6,}")
 IDENTIFIER_LIKE = re.compile(r"[A-Za-z0-9\-]{6,}")  # no spaces, e.g. "AB-77-XYZ12"
 LABEL_LIKE = re.compile(r"[A-Za-z]{3,}-?\d{1,4}(?:-\d{1,4})?")  # e.g. "RRSP-2024-01", "TFSA2024"
@@ -110,23 +107,6 @@ def detect_kind(headers: set[str]) -> str | None:
     if _has(headers, "symbol") and _has(headers, "quantity") and not _has(headers, "type"):
         return "holdings"
     return None
-
-
-def _last4(number: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", number)[-4:]
-
-
-def _mask(match: re.Match) -> str:
-    return BULLETS + re.sub(r"\D", "", match.group())[-4:]
-
-
-def _text(raw: str, number: str = "") -> str:
-    """Free text that may reach model context: drop control chars, mask account numbers, cap the length."""
-    out = "".join(ch for ch in raw if not unicodedata.category(ch).startswith("C")).strip()
-    if len(number) >= 4:
-        out = out.replace(number, BULLETS + _last4(number))
-    out = DIGIT_RUN.sub(_mask, out)
-    return out[:MAX_TEXT]
 
 
 def _date(raw: str) -> str:
@@ -215,9 +195,9 @@ def _account(row: dict[str, str]) -> tuple[str, str, str, str, str]:
     name_raw = _pick(row, "account_name")
     if not number and _looks_like_number(name_raw):
         number = name_raw  # an "Account" column that holds the number itself
-    name = _text(name_raw, number)
-    type_ = _text(_pick(row, "account_type"), number)
-    mask = _last4(number)
+    name = clean_text(name_raw, number)
+    type_ = clean_text(_pick(row, "account_type"), number)
+    mask = last4(number)
     if not (name or type_ or mask):
         raise RowError("missing account")
     # the id derives from non-secret fields only, so the full number never reaches the store
@@ -270,7 +250,7 @@ def import_file(path: Path, conn, now: datetime | None = None) -> ImportResult:
         kind = detect_kind(set(headers))
         if kind is None:
             # header names help fix the alias table; they are masked like any text in case row 1 is data
-            found = _text(", ".join(h for h in headers if h))[:200] or "none"
+            found = clean_text(", ".join(h for h in headers if h))[:200] or "none"
             raise ValueError(f"unrecognised Wealthsimple export format; headers found: {found} (see README)")
         result = ImportResult(kind=kind)
         held: dict[tuple, tuple] = {}  # holdings seen in this file, so split lots can be combined
@@ -302,15 +282,15 @@ def _import_row(conn, kind, row, seen, held, result, file_sha, imported_at, now)
         raise RowError("missing currency")
     if not re.fullmatch(r"[A-Z]{3}", currency):
         raise RowError("invalid currency")
-    symbol = _text(_pick(row, "symbol"), number).upper()
+    symbol = clean_text(_pick(row, "symbol"), number).upper()
     if kind == "activities":
         date = _date(_pick(row, "date"))
-        raw_type = _text(" / ".join(p for p in (_pick(row, "type"), _pick(row, "sub_type")) if p), number)
+        raw_type = clean_text(" / ".join(p for p in (_pick(row, "type"), _pick(row, "sub_type")) if p), number)
         type_ = _activity_type(raw_type)
         qty = _decimal(_pick(row, "quantity"), "quantity")
         price = _decimal(_pick(row, "price"), "price")
         amount = _decimal(_pick(row, "amount"), "amount", required=True)
-        desc = _text(_pick(row, "description"), number)
+        desc = clean_text(_pick(row, "description"), number)
         # the description is left out so a reworded re-export still dedupes; the counter keeps true repeats
         key = _hash(kind, date, account[0], type_, symbol, qty, amount, currency)
         seen[key] = seen.get(key, 0) + 1
@@ -331,7 +311,7 @@ def _import_row(conn, kind, row, seen, held, result, file_sha, imported_at, now)
     as_of_raw = _pick(row, "as_of")
     as_of = _date(as_of_raw) if as_of_raw else now.date().isoformat()
     values = (
-        _text(_pick(row, "name"), number),
+        clean_text(_pick(row, "name"), number),
         _decimal(_pick(row, "quantity"), "quantity", required=True),
         _decimal(_pick(row, "price"), "price"),
         _decimal(_pick(row, "market_value"), "market value"),
