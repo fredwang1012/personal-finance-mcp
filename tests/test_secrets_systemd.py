@@ -1,0 +1,147 @@
+"""systemd credentials backend with a fake credentials dir and a fake systemd-creds; plus the bundle move commands."""
+import base64
+import io
+import json
+
+import pytest
+
+from app import cli, secrets
+from app.config import settings
+
+
+class FakeSystemdCreds:
+    """Stands in for `systemd-creds`: 'encrypts' to a tagged base64 blob bound to the credential name."""
+
+    def __init__(self):
+        self.argv: list[list[str]] = []
+
+    def __call__(self, args, input=None, capture_output=True, check=False):
+        self.argv.append(list(args))
+        assert args[0] == "systemd-creds" and args[2].startswith("--name=")
+        name = args[2].removeprefix("--name=")
+
+        class Done:
+            returncode, stdout = 0, b""
+
+        if args[1] == "encrypt":
+            assert args[3] == "-"  # the value comes from stdin, never argv
+            blob = b"FAKECRED:" + name.encode() + b":" + base64.b64encode(input)
+            open(args[4], "wb").write(blob)
+        elif args[1] == "decrypt":
+            tag, cred_name, data = open(args[3], "rb").read().split(b":", 2)
+            if tag != b"FAKECRED" or cred_name.decode() != name:
+                Done.returncode = 1
+            else:
+                Done.stdout = base64.b64decode(data)
+        return Done()
+
+
+@pytest.fixture
+def systemd(monkeypatch, tmp_path):
+    fake = FakeSystemdCreds()
+    monkeypatch.setattr(settings, "secrets_backend", "systemd")
+    monkeypatch.setattr(settings, "credstore_dir", tmp_path / "credstore")
+    monkeypatch.setattr(secrets, "backend",
+                        lambda: secrets.SystemdCreds(settings.credstore_dir, None, run=fake))
+    return fake
+
+
+def test_service_reads_from_credentials_directory(monkeypatch, tmp_path):
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "plaid_client_id").write_text("cid-1")
+    (creds / "plaid_secret_production").write_text("sec-1")
+    (creds / "plaid_items_production").write_text(json.dumps({"item-A": "access-production-A"}))
+    (creds / "github_client_secret").write_text("gh-secret")
+    (creds / "token_signing_key").write_text("k" * 64 + "\n")
+    monkeypatch.setattr(settings, "secrets_backend", "systemd")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
+    assert secrets.get_client_id() == "cid-1"
+    assert secrets.has_plaid_keys("production") and not secrets.has_plaid_keys("sandbox")
+    assert secrets.list_item_ids("production") == ["item-A"]
+    assert secrets.get_access_token("production", "item-A") == "access-production-A"
+    assert secrets.get_github_client_secret() == "gh-secret"
+    assert secrets.get_signing_key() == b"k" * 64
+    with pytest.raises(secrets.MissingSecret, match="read-only"):
+        secrets.set_access_token("production", "item-B", "x")
+    with pytest.raises(secrets.MissingSecret) as missing:
+        secrets.get_access_token("production", "item-SECRETID")
+    assert "item-SECRETID" not in str(missing.value)
+
+
+def test_admin_round_trip_through_systemd_creds(systemd, tmp_path):
+    secrets.set_plaid_keys("production", "cid-2", "sec-VALUE-2")
+    secrets.set_access_token("production", "item-1", "access-production-VALUE-1")
+    secrets.set_access_token("production", "item-2", "access-production-VALUE-2")
+    assert secrets.get_plaid_secret("production") == "sec-VALUE-2"
+    assert secrets.list_item_ids("production") == ["item-1", "item-2"]
+    secrets.delete_access_token("production", "item-1")
+    assert secrets.list_item_ids("production") == ["item-2"]
+    assert secrets.get_access_token("production", "item-2") == "access-production-VALUE-2"
+    # values never on a command line, never plaintext at rest, no temp files left behind
+    assert not [a for a in systemd.argv if any("VALUE" in part for part in a)]
+    files = list((tmp_path / "credstore").iterdir())
+    assert sorted(f.name for f in files) == ["plaid_client_id", "plaid_items_production", "plaid_secret_production"]
+    assert not [f for f in files if b"VALUE" in f.read_bytes()]
+
+
+def test_invalid_credential_names_refused(systemd):
+    with pytest.raises(secrets.MissingSecret):
+        secrets.backend().get("../etc/passwd")
+
+
+def test_corrupt_items_credential(systemd):
+    secrets.backend().set("plaid_items_production", "[1, 2]")
+    with pytest.raises(secrets.MissingSecret, match="corrupt"):
+        secrets.list_item_ids("production")
+
+
+class Pipe(io.StringIO):
+    def isatty(self):
+        return False
+
+
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_bundle_moves_keys_and_tokens_from_keychain_to_systemd(monkeypatch, tmp_path, capsys):
+    secrets.set_plaid_keys("production", "cid-3", "sec-3")
+    secrets.set_access_token("production", "item-X", "access-production-X")
+    assert cli.export_bundle("production", Tty()) == 1  # never to a terminal
+    out = Pipe()
+    assert cli.export_bundle("production", out) == 0
+    err = capsys.readouterr().err
+    assert "access-production-X" not in err and "item-X" not in err and "sec-3" not in err
+
+    fake = FakeSystemdCreds()
+    monkeypatch.setattr(settings, "secrets_backend", "systemd")
+    monkeypatch.setattr(settings, "credstore_dir", tmp_path / "credstore")
+    monkeypatch.setattr(secrets, "backend", lambda: secrets.SystemdCreds(settings.credstore_dir, None, run=fake))
+    assert cli.import_bundle("sandbox", Pipe(out.getvalue())) == 1  # environment mismatch
+    assert cli.import_bundle("production", Tty(out.getvalue())) == 1
+    assert cli.import_bundle("production", Pipe("not json")) == 1
+    assert cli.import_bundle("production", Pipe(out.getvalue())) == 0
+    printed = capsys.readouterr()
+    assert "access-production-X" not in printed.out + printed.err
+    assert secrets.get_client_id() == "cid-3"
+    assert secrets.get_access_token("production", "item-X") == "access-production-X"
+
+
+def test_import_bundle_refused_on_keychain_backend(capsys):
+    assert cli.import_bundle("production", Pipe("{}")) == 1
+    assert "SECRETS_BACKEND=systemd" in capsys.readouterr().err
+
+
+def test_set_remote_secrets_keychain(monkeypatch, capsys):
+    import getpass
+
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": "gh-SECRETVALUE")
+    assert cli.main(["set-remote-secrets"]) == 0
+    assert secrets.get_github_client_secret() == "gh-SECRETVALUE"
+    first = secrets.get_signing_key()
+    assert len(first) == 64
+    assert cli.main(["set-remote-secrets"]) == 0 and secrets.get_signing_key() == first
+    assert cli.main(["set-remote-secrets", "--rotate-signing-key"]) == 0 and secrets.get_signing_key() != first
+    assert "SECRETVALUE" not in capsys.readouterr().out
