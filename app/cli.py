@@ -337,15 +337,19 @@ def list_clients() -> int:
     admin = _client_admin()
     try:
         rows = admin.rows()
+        used, cap = admin.counts()
     finally:
         admin.close()
-    if not rows:
+    if rows:
+        print(f"{'fingerprint':<12} {'status':<9} {'registered':<24} {'last used':<24} name")
+        for r in rows:
+            print(f"{r['fingerprint']:<12} {r['status']:<9} {r['registered']:<24} {r['last_used']:<24} "
+                  f"{clean_text(r['name'])}")
+    else:
         print("No registered OAuth clients.")
-        return 0
-    print(f"{'fingerprint':<12} {'status':<9} {'registered':<24} {'last used':<24} name")
-    for r in rows:
-        print(f"{r['fingerprint']:<12} {r['status']:<9} {r['registered']:<24} {r['last_used']:<24} "
-              f"{clean_text(r['name'])}")
+    # pending clients expire on their own; approved ones stay until revoked, and revoked ones linger 30 days
+    print(f"{used} of {cap} client slots used. Revoke approved clients you no longer use with "
+          "`revoke-client FINGERPRINT`.")
     return 0
 
 
@@ -363,10 +367,14 @@ def approve_client(fp: str) -> int:
     return 0
 
 
-def revoke_client(fp: str) -> int:
+def revoke_client(fp: str | None, everything: bool = False) -> int:
     admin = _client_admin()
     try:
-        done = admin.revoke(fp)
+        if everything:
+            n = admin.revoke_all()
+            print(f"Revoked {n} client(s) and deleted every token.")
+            return 0
+        done = admin.revoke(fp or "")
     finally:
         admin.close()
     if done is None:
@@ -405,16 +413,20 @@ def main(argv: list[str] | None = None) -> int:
     export_parser.add_argument("--to", metavar="KEY", help="public key printed by bundle-key on the server")
     sub.add_parser("import-bundle", help="server: decrypt a sealed bundle into systemd credentials (as root)")
     sub.add_parser("list-clients", help="list OAuth clients of the remote connector (fingerprint, status, use)")
-    for name, what in (("approve-client", "approve one pending OAuth client"),
-                       ("revoke-client", "revoke an OAuth client and delete its tokens")):
-        sub.add_parser(name, help=what).add_argument("fingerprint", help="8-character fingerprint from list-clients")
+    sub.add_parser("approve-client", help="approve one pending OAuth client").add_argument(
+        "fingerprint", help="8-character fingerprint from list-clients")
+    revoke_parser = sub.add_parser("revoke-client", help="revoke an OAuth client and delete its tokens")
+    revoke_parser.add_argument("fingerprint", nargs="?", help="8-character fingerprint from list-clients")
+    revoke_parser.add_argument("--all", action="store_true", help="revoke every client and delete every token")
     args = parser.parse_args(argv)
     if args.command == "list-clients":
         return list_clients()
     if args.command == "approve-client":
         return approve_client(args.fingerprint)
     if args.command == "revoke-client":
-        return revoke_client(args.fingerprint)
+        if bool(args.all) == bool(args.fingerprint):
+            parser.error("give a FINGERPRINT or --all")
+        return revoke_client(args.fingerprint, args.all)
     if args.command == "serve-http":
         from app import remote
 

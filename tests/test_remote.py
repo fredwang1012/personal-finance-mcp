@@ -333,6 +333,7 @@ def test_unauthenticated_mcp_gets_401_with_resource_metadata(remote):
         header = r.headers["www-authenticate"]
         assert header.startswith("Bearer ")
         assert f'resource_metadata="{PUBLIC}/.well-known/oauth-protected-resource/mcp"' in header
+        assert 'scope="finance.read"' in header
     for method in ("GET", "DELETE"):
         assert client.request(method, "/mcp", headers=MCP_HEADERS).status_code == 401
 
@@ -349,6 +350,8 @@ def test_metadata_documents(remote):
     assert asm["token_endpoint"] == PUBLIC + "/token"
     assert asm["registration_endpoint"] == PUBLIC + "/register"
     assert asm["code_challenge_methods_supported"] == ["S256"]
+    assert asm["token_endpoint_auth_methods_supported"] == ["none", "client_secret_post", "client_secret_basic"]
+    assert "client_id_metadata_document_supported" not in asm  # so Claude uses DCR
     assert asm["response_types_supported"] == ["code"]
     assert set(asm["grant_types_supported"]) == {"authorization_code", "refresh_token"}
     assert "revocation_endpoint" not in asm
@@ -382,7 +385,8 @@ def test_no_route_or_code_path_can_write(remote):
     app = client.app.app  # inside the Guard
     paths = {getattr(r, "path", None) for r in app.routes}
     assert paths == {"/.well-known/oauth-authorization-server", "/authorize", "/token", "/register", "/mcp",
-                     "/.well-known/oauth-protected-resource/mcp", GITHUB_CALLBACK_PATH, "/oauth/consent"}
+                     "/.well-known/oauth-protected-resource/mcp", GITHUB_CALLBACK_PATH, "/oauth/consent",
+                     "/oauth/pending"}
     # the HTTP server's code never references a Plaid call that links, unlinks or moves anything
     writes = ("item_remove", "exchange_public_token", "create_link_token", "link_token", "transfer", "payment")
     for module in ("server.py", "tools.py", "remote.py", "auth.py", "audit.py"):
@@ -536,14 +540,13 @@ def _purge_and_cap(client, provider, clock):
     clock.now += 1801
     admin = ClientAdmin(provider.cfg.db_path, clock)
     assert admin.rows() == [] and admin.approve(fingerprint(client_id)) is None
-    for _ in range(20):
-        register(client)
-    r = client.post("/register", json={"redirect_uris": [CB], "token_endpoint_auth_method": "none"})
-    assert r.status_code == 400 and r.json()["error"] == "invalid_client_metadata"
+    first = [register(client)["client_id"] for _ in range(20)]
+    newest = register(client)["client_id"]  # over the cap: the oldest pending registration gives way
+    ids = {r["fingerprint"] for r in admin.rows()}
+    assert len(ids) == 20 and fingerprint(first[0]) not in ids and fingerprint(newest) in ids
     clock.now += 1801
     assert admin.rows() == []
     admin.close()
-    register(client)  # room again once the old requests expired
 
 
 def test_register_rate_limit(tmp_path, plaid):
@@ -572,3 +575,169 @@ def test_client_cli_commands(remote, monkeypatch, capsys):
     assert cli.main(["list-clients"]) == 0 and "approved" in capsys.readouterr().out
     assert cli.main(["revoke-client", fp]) == 0
     assert cli.main(["list-clients"]) == 0 and "revoked" in capsys.readouterr().out
+
+
+# --- edge cases -------------------------------------------------------------------------------------------------
+
+def test_reload_after_approval_continues_to_consent_without_new_registration(remote):
+    client, provider, _ = remote
+    client_id = register(client)["client_id"]
+    verifier = pysecrets.token_urlsafe(48)
+    r = start_login(client, client_id, verifier)
+    callback = client.get(GITHUB_CALLBACK_PATH, params={"code": "gh", "state": query(r.headers["location"])["state"]},
+                          follow_redirects=False)
+    assert callback.status_code == 303 and callback.headers["location"] == "/oauth/pending"
+    assert "__Host-pfm_hold=" in callback.headers["set-cookie"] and "SameSite=Lax" in callback.headers["set-cookie"]
+    page = client.get("/oauth/pending")
+    assert page.status_code == 403 and "reload this page" in page.text and "consent_id" not in page.text
+    assert client.get("/oauth/pending").status_code == 403  # reload without approval: still pending
+    assert provider._consents == {} and provider._codes == {}
+    approve(provider, client_id)
+    page = client.get("/oauth/pending")  # reload after approval: consent, same registration
+    assert page.status_code == 200 and "Allow Claude?" in page.text
+    assert "Only continue if you just clicked Connect in your own claude.ai." in page.text
+    consent_id = re.search(r"name=consent_id value='([^']+)'", page.text).group(1)
+    csrf = re.search(r"name=csrf value='([^']+)'", page.text).group(1)
+    r = client.post("/oauth/consent", data={"consent_id": consent_id, "csrf": csrf, "action": "approve"},
+                    follow_redirects=False)
+    back = query(r.headers["location"])
+    assert back["state"] == "claude-state"
+    tokens = exchange(client, client_id, back["code"], verifier)
+    assert tokens.status_code == 200
+    assert provider.db.execute("SELECT COUNT(*) FROM clients").fetchone()[0] == 1
+    assert client.get("/oauth/pending").status_code == 400  # the parked login was used up
+
+
+def test_parked_login_is_bound_to_the_browser(remote):
+    client, provider, _ = remote
+    client_id = register(client)["client_id"]
+    r = start_login(client, client_id, "v" * 50)
+    client.get(GITHUB_CALLBACK_PATH, params={"code": "gh", "state": query(r.headers["location"])["state"]})
+    approve(provider, client_id)
+    other_browser = TestClient(client.app, base_url=PUBLIC)  # no `with`: the app's lifespan is already running
+    page = other_browser.get("/oauth/pending")
+    assert page.status_code == 400 and "consent_id" not in page.text
+    other_browser.cookies.set("__Host-pfm_hold", "guessed-value")
+    assert other_browser.get("/oauth/pending").status_code == 400
+    assert provider._consents == {} and provider._codes == {}
+
+
+def test_flood_of_pending_clients_cannot_block_owner_login(tmp_path, plaid):
+    loose = Limits(per_ip=(10_000, 60), register_ip=(10_000, 3600), register_global=(10_000, 86400),
+                   login_ip=(10_000, 60))
+    app, provider, _ = make(tmp_path, limits=loose)
+    with TestClient(app, base_url=PUBLIC) as owner:
+        client_id = register(owner, provider)["client_id"]
+        verifier = pysecrets.token_urlsafe(48)
+        owner_state = query(start_login(owner, client_id, verifier).headers["location"])["state"]
+        # strangers: from the owner's own address (no X-Forwarded-For case) and from many others
+        for i in range(30):
+            ip = "testclient" if i % 2 else f"203.0.113.{i}"
+            stranger = TestClient(app, base_url=PUBLIC, client=(ip, 1000 + i))  # OAuth routes need no lifespan
+            cid = register(stranger)["client_id"]
+            for _ in range(3):
+                start_login(stranger, cid, "x" * 50)
+        assert len(provider._pending) <= 50
+        page = owner.get(GITHUB_CALLBACK_PATH, params={"code": "gh", "state": owner_state})
+        assert page.status_code == 200 and "Allow Claude?" in page.text
+
+
+def test_logins_per_client_are_capped(remote):
+    client, provider, _ = remote
+    client_id = register(client, provider)["client_id"]
+    states = [query(start_login(client, client_id, "v" * 50).headers["location"])["state"] for _ in range(3)]
+    assert sum(1 for v in provider._pending.values() if v["client_id"] == client_id) == 2
+    assert client.get(GITHUB_CALLBACK_PATH, params={"code": "gh", "state": states[0]}).status_code == 400
+    assert client.get(GITHUB_CALLBACK_PATH, params={"code": "gh", "state": states[2]}).status_code == 200
+
+
+def test_authenticated_mcp_is_exempt_from_per_ip_limit(tmp_path, plaid):
+    limits = Limits(per_ip=(30, 60), mcp_unauthenticated_ip=(2, 60))
+    app, provider, _ = make(tmp_path, limits=limits)
+    with TestClient(app, base_url=PUBLIC) as c:
+        _, tokens = full_login(c, provider)
+        assert all(rpc(c, tokens["access_token"], "tools/list").status_code == 200 for _ in range(40))
+        assert [rpc(c, None, "tools/list").status_code for _ in range(3)] == [401, 401, 429]
+    provider.close()
+
+
+def test_replayed_code_revokes_what_it_issued(remote):
+    client, provider, _ = remote
+    client_id = register(client, provider)["client_id"]
+    verifier = pysecrets.token_urlsafe(48)
+    code = login_code(client, client_id, verifier)
+    tokens = exchange(client, client_id, code, verifier).json()
+    assert rpc(client, tokens["access_token"], "tools/list").status_code == 200
+    assert exchange(client, client_id, code, verifier).json()["error"] == "invalid_grant"
+    assert rpc(client, tokens["access_token"], "tools/list").status_code == 401
+
+
+def test_wrong_pkce_verifier_burns_the_code(remote):
+    client, provider, _ = remote
+    client_id = register(client, provider)["client_id"]
+    verifier = pysecrets.token_urlsafe(48)
+    code = login_code(client, client_id, verifier)
+    assert exchange(client, client_id, code, "w" * 50).json()["error"] == "invalid_grant"
+    assert exchange(client, client_id, code, verifier).json()["error"] == "invalid_grant"
+
+
+def test_losing_a_refresh_race_revokes_the_family(remote):
+    import asyncio
+
+    from mcp.server.auth.provider import TokenError
+
+    client, provider, _ = remote
+    client_id, tokens = full_login(client, provider)
+    info = asyncio.run(provider.get_client(client_id))
+    rt = asyncio.run(provider.load_refresh_token(info, tokens["refresh_token"]))
+    second = asyncio.run(provider.exchange_refresh_token(info, rt, rt.scopes))  # the winner
+    with pytest.raises(TokenError):
+        asyncio.run(provider.exchange_refresh_token(info, rt, rt.scopes))  # the loser, same token
+    assert rpc(client, second.access_token, "tools/list").status_code == 401
+
+
+def test_basic_auth_client_id_is_parsed_for_rate_limits():
+    import base64
+
+    from app.remote import _basic_client_id
+
+    assert _basic_client_id(b"Basic " + base64.b64encode(b"abc%2Did:secret")) == "abc-id"
+    assert _basic_client_id(b"Bearer x") == "" and _basic_client_id(b"Basic !!!") == ""
+
+
+def test_rate_limiter_evicts_idle_buckets_and_caps_keys(monkeypatch):
+    now = [0.0]
+    limiter = RateLimiter(clock=lambda: now[0])
+    for i in range(100):
+        limiter.hit(f"k{i}", (5, 60))
+    now[0] = 61
+    limiter.hit("fresh", (5, 60))
+    assert list(limiter.hits) == ["fresh"]  # everything idle for over a window is gone
+    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 10)
+    for i in range(50):
+        limiter.hit(f"live{i}", (5, 60))
+    assert len(limiter.hits) == 10 and "live49" in limiter.hits
+
+
+def test_missing_forwarded_address_is_warned_once(tmp_path, plaid, caplog):
+    app, provider, _ = make(tmp_path)
+    with TestClient(app, base_url=PUBLIC, client=("127.0.0.1", 5000)) as c, caplog.at_level("WARNING"):
+        c.get("/.well-known/oauth-authorization-server")
+        c.get("/.well-known/oauth-authorization-server")
+    assert sum("X-Forwarded-For" in r.message for r in caplog.records) == 1
+    provider.close()
+
+
+def test_revoke_all_clients(remote, monkeypatch, capsys):
+    from app import cli
+
+    client, provider, _ = remote
+    monkeypatch.setattr(settings, "data_dir", provider.cfg.db_path.parent)
+    _, tokens = full_login(client, provider)
+    register(client)
+    assert cli.main(["revoke-client", "--all"]) == 0
+    assert "2 client" in capsys.readouterr().out
+    assert rpc(client, tokens["access_token"], "tools/list").status_code == 401
+    assert cli.main(["list-clients"]) == 0
+    rows = [line.split()[1] for line in capsys.readouterr().out.splitlines()[1:-1]]
+    assert rows == ["revoked", "revoked"]

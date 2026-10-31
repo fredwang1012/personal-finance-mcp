@@ -4,24 +4,37 @@ Binds 127.0.0.1 only; Tailscale Funnel forwards public HTTPS to it. Every MCP re
 app.auth for this exact resource URL. Around the SDK's app sit a body-size cap, per-client rate limits, an audit log
 of tool names (never arguments or results) and an error guard that never returns a traceback.
 """
+import base64
 import json
 import logging
 import time
 import urllib.parse
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware import Middleware
+from starlette.routing import Route
 
 from app import server
 from app.audit import Audit
-from app.auth import CONSENT_PATH, GITHUB_CALLBACK_PATH, SCOPE, AuthConfig, OwnerOAuthProvider, canonical
+from app.auth import (
+    CONSENT_PATH,
+    GITHUB_CALLBACK_PATH,
+    PENDING_PATH,
+    SCOPE,
+    AuthConfig,
+    OwnerOAuthProvider,
+    canonical,
+    request_ip,
+)
 
 log = logging.getLogger("personal-finance-mcp.remote")
 
@@ -34,33 +47,45 @@ class Limits:
     """(requests, window seconds) per key."""
     per_ip: tuple[int, int] = (300, 60)
     register_ip: tuple[int, int] = (10, 3600)
-    register_global: tuple[int, int] = (30, 86400)
+    register_global: tuple[int, int] = (200, 86400)  # pending clients are capped and expire, so this can be loose
     token_client: tuple[int, int] = (30, 60)
     token_global: tuple[int, int] = (120, 60)
     login_ip: tuple[int, int] = (30, 60)
     mcp_client: tuple[int, int] = (120, 60)
+    mcp_unauthenticated_ip: tuple[int, int] = (60, 60)
 
 
 class RateLimiter:
-    """Sliding-window counter in memory. Restarting the service resets it, which is acceptable for one owner."""
+    """Sliding-window counter in memory. Restarting the service resets it, which is acceptable for one owner.
+
+    Buckets idle for longer than their window are dropped, and the number of keys is capped (least recently used
+    goes first), so a flood of distinct keys cannot grow memory without bound."""
+
+    MAX_KEYS = 10000
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
-        self.hits: dict[str, deque] = defaultdict(deque)
+        self.hits: OrderedDict[str, tuple[deque, int]] = OrderedDict()  # key -> (timestamps, window)
+
+    def _evict(self, now: float) -> None:
+        while self.hits:
+            key, (q, window) = next(iter(self.hits.items()))
+            if q and q[-1] > now - window and len(self.hits) <= self.MAX_KEYS:
+                break  # the least recently used bucket is still live, so all later ones are too
+            del self.hits[key]
 
     def hit(self, key: str, rule: tuple[int, int]) -> int | None:
         """Record a request; return seconds to wait if over the limit, else None."""
         limit, window = rule
         now = self.clock()
-        q = self.hits[key]
+        q, _ = self.hits.pop(key, (deque(), window))
+        self.hits[key] = (q, window)  # most recently used goes last
         while q and q[0] <= now - window:
             q.popleft()
         if len(q) >= limit:
             return max(1, int(q[0] + window - now) + 1)
         q.append(now)
-        if len(self.hits) > 10000:  # drop idle keys so memory stays bounded
-            for k in [k for k, v in self.hits.items() if not v]:
-                del self.hits[k]
+        self._evict(now)
         return None
 
 
@@ -87,8 +112,9 @@ SECURITY_HEADERS = [(b"x-content-type-options", b"nosniff"), (b"referrer-policy"
 class Guard:
     """Outermost layer: error guard, body cap, per-IP and per-endpoint rate limits, /token resource check."""
 
-    def __init__(self, app, limiter: RateLimiter, limits: Limits, resource: str):
-        self.app, self.limiter, self.limits, self.resource = app, limiter, limits, resource
+    def __init__(self, app, limiter: RateLimiter, limits: Limits, resource: str, provider=None):
+        self.app, self.limiter, self.limits, self.resource, self.provider = app, limiter, limits, resource, provider
+        self._warned_no_forwarded_ip = False
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -99,7 +125,12 @@ class Guard:
             nonlocal started
             if message["type"] == "http.response.start":
                 started = True
-                message = {**message, "headers": [*message.get("headers", []), *SECURITY_HEADERS]}
+                headers = list(message.get("headers", []))
+                if message.get("status") == 401 and scope.get("path") == "/mcp":
+                    # RFC 6750 / MCP 2025-11-25: name the scope the client should ask for
+                    headers = [(k, v + f', scope="{SCOPE}"'.encode()) if k.lower() == b"www-authenticate" else (k, v)
+                               for k, v in headers]
+                message = {**message, "headers": [*headers, *SECURITY_HEADERS]}
             await send(message)
 
         try:
@@ -116,6 +147,11 @@ class Guard:
         path, method = scope.get("path", ""), scope.get("method", "")
         # uvicorn's proxy_headers puts the Funnel client address here (only 127.0.0.1 is trusted to set it)
         ip = (scope.get("client") or ("unknown",))[0]
+        if ip in ("127.0.0.1", "::1") and not self._warned_no_forwarded_ip:
+            self._warned_no_forwarded_ip = True
+            log.warning("request without a forwarded client address (no X-Forwarded-For from the proxy); "
+                        "per-IP limits then apply to all clients together")
+        request_ip.set(ip)
         headers = dict(scope.get("headers") or [])
         try:
             length = int(headers.get(b"content-length", b"0") or 0)
@@ -125,7 +161,9 @@ class Guard:
             return await _send_json(send, 413, {"error": "too_large"})
 
         lim, rules = self.limiter, self.limits
-        checks = [(f"ip:{ip}", rules.per_ip)]
+        # /mcp is limited after authentication instead (ClientRateLimit), so strangers sharing the owner's
+        # address cannot use up the owner's quota
+        checks = [] if path == "/mcp" else [(f"ip:{ip}", rules.per_ip)]
         if path == "/register" and method == "POST":
             checks += [(f"register:{ip}", rules.register_ip), ("register", rules.register_global)]
         elif path == "/authorize" or path.startswith("/oauth/"):
@@ -154,7 +192,7 @@ class Guard:
                 if not message.get("more_body"):
                     break
             form = urllib.parse.parse_qs(body.decode("latin-1"))
-            client_id = (form.get("client_id") or [""])[0][:64]
+            client_id = (form.get("client_id") or [_basic_client_id(headers.get(b"authorization", b""))])[0][:64]
             for key, rule in ((f"token:{client_id}", rules.token_client), ("token", rules.token_global)):
                 retry = lim.hit(key, rule)
                 if retry:
@@ -163,6 +201,9 @@ class Guard:
             if resource is not None and canonical(resource) != canonical(self.resource):
                 return await _send_json(send, 400, {"error": "invalid_target",
                                                     "error_description": "Unknown resource."})
+            code, verifier = (form.get("code") or [None])[0], (form.get("code_verifier") or [None])[0]
+            if self.provider is not None and code and verifier:
+                self.provider.burn_code_on_bad_verifier(code, verifier)
             replayed = False
 
             async def replay():
@@ -176,16 +217,31 @@ class Guard:
         return await self.app(scope, counted_receive, send)
 
 
+def _basic_client_id(header: bytes) -> str:
+    """client_id from an HTTP Basic Authorization header (client_secret_basic), or ''."""
+    try:
+        scheme, _, value = header.decode("latin-1").partition(" ")
+        if scheme.lower() != "basic":
+            return ""
+        return urllib.parse.unquote(base64.b64decode(value).decode("utf-8").split(":", 1)[0])
+    except (ValueError, UnicodeDecodeError):
+        return ""
+
+
 class ClientRateLimit:
     """Inside the SDK's auth middleware, so the authenticated OAuth client is known: per-client limit on /mcp."""
 
-    def __init__(self, app, limiter: RateLimiter, rule: tuple[int, int]):
-        self.app, self.limiter, self.rule = app, limiter, rule
+    def __init__(self, app, limiter: RateLimiter, rule: tuple[int, int], anonymous_rule: tuple[int, int]):
+        self.app, self.limiter, self.rule, self.anonymous_rule = app, limiter, rule, anonymous_rule
 
     async def __call__(self, scope, receive, send):
-        user = scope.get("user")
-        if scope["type"] == "http" and isinstance(user, AuthenticatedUser):
-            retry = self.limiter.hit(f"mcp:{user.access_token.client_id}", self.rule)
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            user = scope.get("user")
+            if isinstance(user, AuthenticatedUser):
+                retry = self.limiter.hit(f"mcp:{user.access_token.client_id}", self.rule)
+            else:
+                ip = (scope.get("client") or ("unknown",))[0]
+                retry = self.limiter.hit(f"mcp-anon:{ip}", self.anonymous_rule)
             if retry:
                 return await _too_many(send, retry)
         await self.app(scope, receive, send)
@@ -245,6 +301,7 @@ def build_app(cfg: RemoteConfig, github, limits: Limits = Limits(), clock: Calla
     mcp = server.build_server(auth=settings, auth_server_provider=provider, middleware=[AuditMiddleware(audit)])
     mcp.custom_route(GITHUB_CALLBACK_PATH, methods=["GET"])(provider.github_callback)
     mcp.custom_route(CONSENT_PATH, methods=["POST"])(provider.consent)
+    mcp.custom_route(PENDING_PATH, methods=["GET"])(provider.pending)
     host = urllib.parse.urlsplit(public).netloc
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -254,10 +311,27 @@ def build_app(cfg: RemoteConfig, github, limits: Limits = Limits(), clock: Calla
     )
     app = mcp.streamable_http_app(stateless_http=True, json_response=True, transport_security=security,
                                   max_request_body_size=MAX_BODY)
+    _advertise_public_clients(app, settings)
     limiter = limiter or RateLimiter()
     # appended after the SDK's auth middleware, so it runs with the authenticated user known
-    app.user_middleware.append(Middleware(ClientRateLimit, limiter=limiter, rule=limits.mcp_client))
-    return Guard(app, limiter, limits, auth_cfg.resource), provider
+    app.user_middleware.append(Middleware(ClientRateLimit, limiter=limiter, rule=limits.mcp_client,
+                                          anonymous_rule=limits.mcp_unauthenticated_ip))
+    return Guard(app, limiter, limits, auth_cfg.resource, provider), provider
+
+
+def _advertise_public_clients(app, settings: AuthSettings) -> None:
+    """The SDK's AS metadata omits `none` from token_endpoint_auth_methods_supported although its token endpoint
+    accepts public clients (Claude registers as one). Serve the same document with `none` added."""
+    metadata = build_metadata(settings.issuer_url, settings.service_documentation_url,
+                              settings.client_registration_options, settings.revocation_options)
+    metadata.token_endpoint_auth_methods_supported = ["none", "client_secret_post", "client_secret_basic"]
+    path = "/.well-known/oauth-authorization-server"
+    for i, route in enumerate(app.router.routes):
+        if getattr(route, "path", None) == path:
+            app.router.routes[i] = Route(path, endpoint=cors_middleware(MetadataHandler(metadata).handle,
+                                                                        ["GET", "OPTIONS"]), methods=["GET", "OPTIONS"])
+            return
+    raise RuntimeError("authorization server metadata route not found")
 
 
 def serve() -> int:

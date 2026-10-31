@@ -7,16 +7,26 @@ middleware); this module supplies the provider behind them plus two pages of its
   otherwise 403 and nothing is issued) -> consent page naming the client -> POST /oauth/consent -> code back to
   Claude's callback -> /token.
 
+  For a client that is still pending, the callback instead parks the login behind a `__Host-` cookie and sends the
+  browser to /oauth/pending, which says how to approve it; reloading that page after approval continues to consent,
+  so it works whether or not Claude reuses its registration on the next Connect.
+
 Rules enforced here:
 - Dynamic client registration accepts only Claude's documented callback URLs as redirect URIs, and every new client
   starts `pending`: it gets no code until the owner approves it on the server (`python -m app.cli approve-client FP`).
   Otherwise anyone could add this URL in their own claude.ai account and send the owner the sign-in link; the owner
   would see "Allow Claude?" and the code would land in the attacker's Claude session. Pending clients expire after
-  30 minutes and at most 20 may wait at once.
+  30 minutes; at most 20 wait at once, the oldest giving way to a new one.
+- Logins in progress are capped per client (2), per IP (5) and in total (50). A stranger's logins never push out
+  one for an approved client, so registrations from elsewhere cannot block the owner's sign-in.
 - The `resource` (RFC 8707) must be this server's MCP URL; tokens are bound to it and checked on every request.
-- Access tokens live one hour. Refresh tokens rotate on every use; presenting a used one revokes its whole family.
+- Access tokens live one hour. Refresh tokens rotate on every use; presenting a used one (or losing a race to use it)
+  revokes its whole family. A code works once; replaying it revokes what it issued, and a wrong PKCE verifier
+  burns it.
 - Codes and tokens are random strings stored only as HMAC-SHA256 digests keyed by the signing key; client secrets
-  are derived from the signing key and never stored. Rotating the key therefore invalidates every token and client.
+  are derived from the signing key and never stored. Rotating the key invalidates every token and every
+  confidential client's secret, but not the approval of public clients (Claude registers as one): revoke those with
+  `revoke-client --all` or delete oauth.db.
 - Secret comparisons use hmac.compare_digest.
 """
 import asyncio
@@ -32,6 +42,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -66,10 +77,19 @@ MAX_PENDING_CLIENTS = 20
 PENDING_CLIENT_TTL = 1800
 APPROVE_CMD = "python -m app.cli approve-client"
 MAX_PENDING = 50
+MAX_LOGINS_PER_CLIENT = 2
+MAX_LOGINS_PER_IP = 5
+MAX_HOLDS = 10
+PENDING_PATH = "/oauth/pending"
+HOLD_COOKIE = "__Host-pfm_hold"
 MAX_CLIENT_NAME = 80
 GITHUB_CALLBACK_PATH = "/oauth/github/callback"
 CONSENT_PATH = "/oauth/consent"
 CONSENT_COOKIE = "__Host-pfm_consent"
+
+
+# set by app.remote's outer middleware for each request: the client address Funnel forwarded
+request_ip: ContextVar[str] = ContextVar("request_ip", default="unknown")
 
 
 def canonical(url: str | None) -> str:
@@ -229,6 +249,16 @@ class ClientAdmin:
         self.db.execute("UPDATE clients SET status = 'revoked' WHERE client_id = ?", (matches[0],))
         return fingerprint(matches[0])
 
+    def revoke_all(self) -> int:
+        """Revoke every client and delete every token; returns how many clients were revoked."""
+        n = self.db.execute("UPDATE clients SET status = 'revoked' WHERE status != 'revoked'").rowcount
+        self.db.execute("DELETE FROM tokens")
+        return n
+
+    def counts(self) -> tuple[int, int]:
+        """(clients counting toward MAX_CLIENTS, MAX_CLIENTS)."""
+        return self.db.execute("SELECT COUNT(*) FROM clients").fetchone()[0], MAX_CLIENTS
+
     def close(self) -> None:
         self.db.close()
 
@@ -239,7 +269,8 @@ def _page(title: str, body: str, status: int = 200, headers: dict | None = None)
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{html.escape(title)}</title><style>body{{font-family:system-ui,sans-serif;max-width:32rem;"
         "margin:3rem auto;padding:0 1rem;line-height:1.5}button{font-size:1rem;padding:.6rem 1.2rem;margin:.3rem}"
-        f"code{{background:#eee;padding:0 .2rem}}</style></head><body>{body}</body></html>"
+        f"code{{background:#eee;padding:0 .2rem}}.warn{{background:#fff3cd;padding:.5rem}}</style></head>"
+        f"<body>{body}</body></html>"
     )
     base = {
         "Cache-Control": "no-store",
@@ -260,6 +291,8 @@ class OwnerOAuthProvider:
         self._pending: dict[str, dict] = {}   # GitHub state -> authorization request waiting for login
         self._consents: dict[str, dict] = {}  # consent id -> approved login waiting for the owner's click
         self._codes: dict[str, dict] = {}     # code digest -> authorization code
+        self._used_codes: dict[str, dict] = {}  # code digest -> token family it issued (replay detection)
+        self._holds: dict[str, dict] = {}     # hold id -> owner login parked until the client is approved
 
     # --- helpers ------------------------------------------------------------------------------------------------
 
@@ -271,6 +304,16 @@ class OwnerOAuthProvider:
 
     def _expire(self, table: dict, now: float) -> None:
         for key in [k for k, v in table.items() if v["expires_at"] < now]:
+            del table[key]
+
+    @staticmethod
+    def _trim(table: dict, match, keep: int, protect_approved: bool) -> None:
+        """Drop the oldest entries matching `match` until `keep` remain; approved-client logins are spared when
+        `protect_approved`, so nobody else's traffic can push them out."""
+        victims = sorted((v["created"], k) for k, v in table.items()
+                         if match(v) and not (protect_approved and v["approved"]))
+        excess = sum(1 for v in table.values() if match(v)) - keep
+        for _, key in victims[:max(0, excess)]:
             del table[key]
 
     def _redirect_error(self, pending: dict, error: str) -> RedirectResponse:
@@ -313,9 +356,11 @@ class OwnerOAuthProvider:
         now = self.clock()
         with self._lock:
             purge_clients(self.db, now)
-            pending = self.db.execute("SELECT COUNT(*) FROM clients WHERE status = 'pending'").fetchone()[0]
+            # the oldest pending registrations give way, so a flood cannot stop a new one from the owner
+            self.db.execute("DELETE FROM clients WHERE client_id IN (SELECT client_id FROM clients WHERE status = "
+                            "'pending' ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)", (MAX_PENDING_CLIENTS - 1,))
             count = self.db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
-            if pending >= MAX_PENDING_CLIENTS or count >= MAX_CLIENTS:
+            if count >= MAX_CLIENTS:  # approved and revoked clients: only the owner can make room (revoke-client)
                 raise RegistrationError("invalid_client_metadata", "Too many registered clients; try again later.")
             if client_info.token_endpoint_auth_method != "none":
                 # the SDK minted a random secret; replace it with one derived from the signing key so none is stored
@@ -333,13 +378,18 @@ class OwnerOAuthProvider:
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         if not self.check_resource(params.resource):
             raise AuthorizeError("invalid_target", "Unknown resource.")
-        now = self.clock()
+        approved = self._approved(client.client_id)
+        now, ip = self.clock(), request_ip.get()
         state, verifier = pysecrets.token_urlsafe(32), pysecrets.token_urlsafe(48)
         with self._lock:
             self._expire(self._pending, now)
-            if len(self._pending) >= MAX_PENDING:
-                raise AuthorizeError("temporarily_unavailable", "Too many sign-ins in progress.")
+            self._trim(self._pending, lambda v: v["client_id"] == client.client_id, MAX_LOGINS_PER_CLIENT - 1, False)
+            self._trim(self._pending, lambda v: v["ip"] == ip, MAX_LOGINS_PER_IP - 1, True)
+            self._trim(self._pending, lambda v: True, MAX_PENDING - 1, True)
+            if len(self._pending) >= MAX_PENDING:  # only approved-client logins left; drop the oldest of those
+                self._trim(self._pending, lambda v: True, MAX_PENDING - 1, False)
             self._pending[state] = {
+                "ip": ip, "approved": approved, "created": now,
                 "client_id": client.client_id, "client_name": client.client_name or "",
                 "redirect_uri": str(params.redirect_uri), "explicit": params.redirect_uri_provided_explicitly,
                 "state": params.state, "code_challenge": params.code_challenge,
@@ -367,34 +417,64 @@ class OwnerOAuthProvider:
         if not hmac.compare_digest(str(uid), str(self.cfg.allowed_user_id)):
             self.audit.event("login_denied", client=pending["client_id"], github_user_id=uid)
             return _page("Not allowed", "<h1>Not allowed</h1><p>This GitHub account cannot use this server.</p>", 403)
-        client_row = self._client_row(pending["client_id"])
+        self.audit.event("login_allowed", client=pending["client_id"])
+        return self._after_login({**pending, "subject": str(uid)}, hold_id=None)
+
+    def _after_login(self, entry: dict, hold_id: str | None) -> Response:
+        """Owner is signed in: consent page if the client is approved, else park the login until it is."""
+        client_row = self._client_row(entry["client_id"])
         if client_row is None or client_row[0] == "revoked":
+            if hold_id:
+                with self._lock:
+                    self._holds.pop(hold_id, None)
             return _page("Connection removed", "<h1>This connection was removed or expired</h1>"
                          "<p>Remove the connector in Claude and add it again.</p>", 403)
-        fp = fingerprint(pending["client_id"])
-        name = html.escape(pending["client_name"] or "An unnamed client")
-        registered = html.escape(_when(client_row[1]))
         if client_row[0] == "pending":
-            # nothing is issued: the owner must confirm on the server that this registration is their own
-            self.audit.event("login_pending_client", client=pending["client_id"])
-            body = (
-                "<h1>New connection needs approval</h1>"
-                f"<p><b>{name}</b> registered at {registered}, fingerprint <code>{fp}</code>.</p>"
-                f"<p>To allow this connection, run on the server: <code>{APPROVE_CMD} {fp}</code>. "
-                "Only do this if you just clicked Connect in your own claude.ai.</p>"
-                f"<p>On the VM that is <code>sudo pfmcp approve-client {fp}</code>. Then click Connect in Claude "
-                "again. The request expires 30 minutes after it was registered.</p>"
-                "<p>If you did not just click Connect yourself, do nothing: someone may be trying to get you to "
-                "give their Claude account access to your data.</p>"
-            )
-            return _page("Approval needed", body, 403)
+            if hold_id is None:
+                hold_id = pysecrets.token_urlsafe(32)
+                with self._lock:
+                    self._expire(self._holds, self.clock())
+                    self._trim(self._holds, lambda v: True, MAX_HOLDS - 1, False)
+                    self._holds[hold_id] = {**entry, "created": self.clock(),
+                                            "expires_at": client_row[1] + PENDING_CLIENT_TTL}
+                self.audit.event("login_pending_client", client=entry["client_id"])
+                # a redirect, so that reloading the page does not replay the one-time GitHub callback
+                cookie = (f"{HOLD_COOKIE}={hold_id}; Path=/; Secure; HttpOnly; SameSite=Lax; "
+                          f"Max-Age={PENDING_CLIENT_TTL}")
+                return RedirectResponse(PENDING_PATH, status_code=303,
+                                        headers={"Cache-Control": "no-store", "Set-Cookie": cookie})
+            return self._pending_page(entry, client_row)
+        if hold_id:
+            with self._lock:
+                self._holds.pop(hold_id, None)
+        return self._consent_page(entry, client_row, clear_hold=hold_id is not None)
+
+    def _describe(self, entry: dict, client_row) -> tuple[str, str, str]:
+        return (html.escape(entry["client_name"] or "An unnamed client"), fingerprint(entry["client_id"]),
+                html.escape(_when(client_row[1])))
+
+    def _pending_page(self, entry: dict, client_row) -> Response:
+        # nothing is issued: the owner must confirm on the server that this registration is their own
+        name, fp, registered = self._describe(entry, client_row)
+        body = (
+            "<h1>New connection needs approval</h1>"
+            f"<p><b>{name}</b> registered at {registered}, fingerprint <code>{fp}</code>.</p>"
+            f"<p>To allow this connection, run on the server: <code>{APPROVE_CMD} {fp}</code>. "
+            "Only do this if you just clicked Connect in your own claude.ai.</p>"
+            f"<p>On the VM that is <code>sudo pfmcp approve-client {fp}</code>. Then <b>reload this page</b> to "
+            "continue. The request expires 30 minutes after it was registered.</p>"
+            "<p class=warn>If you did not just click Connect yourself, do nothing: someone may be trying to get "
+            "you to give their Claude account access to your data.</p>"
+        )
+        return _page("Approval needed", body, 403)
+
+    def _consent_page(self, entry: dict, client_row, clear_hold: bool) -> Response:
+        name, fp, registered = self._describe(entry, client_row)
         consent_id, csrf = pysecrets.token_urlsafe(32), pysecrets.token_urlsafe(32)
         with self._lock:
             self._expire(self._consents, self.clock())
-            self._consents[consent_id] = {**pending, "csrf": csrf, "subject": str(uid),
-                                          "expires_at": self.clock() + CONSENT_TTL}
-        self.audit.event("login_allowed", client=pending["client_id"])
-        host = html.escape(urllib.parse.urlsplit(pending["redirect_uri"]).hostname or "")
+            self._consents[consent_id] = {**entry, "csrf": csrf, "expires_at": self.clock() + CONSENT_TTL}
+        host = html.escape(urllib.parse.urlsplit(entry["redirect_uri"]).hostname or "")
         body = (
             f"<h1>Allow {name}?</h1>"
             f"<p><b>{name}</b> (fingerprint <code>{fp}</code>, registered {registered}, approved on the server) "
@@ -402,12 +482,28 @@ class OwnerOAuthProvider:
             "access to your personal finance data: accounts, balances, holdings and transactions. "
             "It cannot move money or change anything.</p>"
             f"<p>After you choose, you will be sent back to <b>{host}</b>.</p>"
+            "<p class=warn>Only continue if you just clicked Connect in your own claude.ai.</p>"
             f"<form method=post action='{CONSENT_PATH}'>"
             f"<input type=hidden name=consent_id value='{consent_id}'><input type=hidden name=csrf value='{csrf}'>"
             "<button name=action value=approve>Allow</button><button name=action value=deny>Deny</button></form>"
         )
-        cookie = f"{CONSENT_COOKIE}={csrf}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={CONSENT_TTL}"
-        return _page(f"Allow {pending['client_name'] or 'client'}?", body, headers={"Set-Cookie": cookie})
+        response = _page(f"Allow {entry['client_name'] or 'client'}?", body)
+        response.headers.append(
+            "Set-Cookie", f"{CONSENT_COOKIE}={csrf}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={CONSENT_TTL}")
+        if clear_hold:
+            response.headers.append("Set-Cookie", f"{HOLD_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
+        return response
+
+    async def pending(self, request: Request) -> Response:
+        """GET /oauth/pending: the parked login of this browser (by cookie), now continued if the client is approved."""
+        hold_id = request.cookies.get(HOLD_COOKIE, "")
+        with self._lock:
+            self._expire(self._holds, self.clock())
+            entry = self._holds.get(hold_id) if hold_id else None
+        if entry is None:
+            return _page("Nothing waiting", "<h1>Nothing is waiting for approval in this browser</h1>"
+                         "<p>Start again from Claude.</p>", 400)
+        return self._after_login(entry, hold_id)
 
     async def consent(self, request: Request) -> Response:
         form = await request.form()
@@ -431,9 +527,25 @@ class OwnerOAuthProvider:
         clear = f"{CONSENT_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
         return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store", "Set-Cookie": clear})
 
-    async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str):
+    def burn_code_on_bad_verifier(self, code: str, verifier: str) -> None:
+        """Called before the SDK's /token handler: a wrong PKCE verifier destroys the code, so it cannot be retried."""
+        digest = self._digest("code", code)
         with self._lock:
-            entry = self._codes.get(self._digest("code", authorization_code))
+            entry = self._codes.get(digest)
+            if entry is not None and not hmac.compare_digest(s256(verifier), entry["code_challenge"]):
+                del self._codes[digest]
+                self.audit.event("code_burned", client=entry["client_id"], reason="pkce")
+
+    async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str):
+        digest = self._digest("code", authorization_code)
+        with self._lock:
+            self._expire(self._used_codes, self.clock())
+            used = self._used_codes.pop(digest, None)
+            entry = self._codes.get(digest)
+        if used is not None:  # a redeemed code came back: whoever has it may hold the tokens too, so revoke them
+            self._revoke_family(used["family"])
+            self.audit.event("code_replay_revoked", client=used["client_id"])
+            return None
         if entry is None or entry["client_id"] != client.client_id or entry["expires_at"] < self.clock():
             return None
         return AuthorizationCode(
@@ -481,8 +593,11 @@ class OwnerOAuthProvider:
             entry = self._codes.pop(self._digest("code", authorization_code.code), None)
         if entry is None or not self._approved(client.client_id):
             raise TokenError("invalid_grant", "authorization code does not exist")
-        tokens = self._issue(client.client_id, entry["scopes"], entry["subject"], pysecrets.token_urlsafe(16),
-                             self.clock())
+        family = pysecrets.token_urlsafe(16)
+        with self._lock:
+            self._used_codes[self._digest("code", authorization_code.code)] = {
+                "family": family, "client_id": client.client_id, "expires_at": self.clock() + 2 * CODE_TTL}
+        tokens = self._issue(client.client_id, entry["scopes"], entry["subject"], family, self.clock())
         self.audit.event("token_issued", client=client.client_id)
         return tokens
 
@@ -508,7 +623,9 @@ class OwnerOAuthProvider:
         with self._lock:
             used = self.db.execute("UPDATE tokens SET used_at = ? WHERE hash = ? AND used_at IS NULL",
                                    (self.clock(), row["hash"])).rowcount
-        if used != 1:
+        if used != 1:  # lost a race with another use of the same refresh token: treat it as reuse
+            self._revoke_family(row["family"])
+            self.audit.event("refresh_reuse_revoked", client=client.client_id)
             raise TokenError("invalid_grant", "refresh token already used")
         self.audit.event("token_refreshed", client=client.client_id)
         return self._issue(client.client_id, scopes, row["subject"], row["family"], row["family_created"])

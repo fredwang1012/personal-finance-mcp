@@ -480,3 +480,22 @@ def test_item_health_alone_scrubs_account_ids(csv_conn):
     b = tools.Backend(csv_conn, HostilePlaid(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
     blob = json.dumps(tools.item_health(b))
     assert PID_TFSA not in blob and TOKEN_OK not in blob and "WS" in blob
+
+
+def test_id_shaped_strings_scrubbed_even_when_accounts_get_fails(csv_conn):
+    real_looking_id = "BxBXxLj1m4HMXBm9WZZmCWVbPjX16EHwv99vp"
+
+    class NoAccounts(FakePlaid):
+        def accounts_get(self, token):
+            raise PlaidError("INTERNAL_SERVER_ERROR", "down")
+
+        def item_get(self, token):
+            r = super().item_get(token)
+            r["item"]["institution_name"] = f"WS {real_looking_id} Canada"
+            return r
+
+    b = tools.Backend(csv_conn, NoAccounts(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    out = tools.item_health(b)
+    assert real_looking_id not in json.dumps(out)
+    assert out["items"][0]["institution"] == "WS [redacted] Canada"
+    assert b.clean("Bought 12.5 units at 1234.56 USD") == "Bought 12.5 units at 1234.56 USD"

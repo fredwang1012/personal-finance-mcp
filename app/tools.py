@@ -28,6 +28,9 @@ LIABILITY_TYPES = {"credit", "loan"}
 INVESTMENT_TYPES = {"buy", "sell", "dividend"}
 LINK_CMD = "python -m app.cli link"
 TOKEN_RE = re.compile(r"(?:access|link|public)-[a-z]+-[\w-]+")
+# Plaid item and account ids are long letter-digit runs (37 characters); nothing a tool should show looks like that,
+# and amounts never do (they have at most a few dozen digits with separators, and digit runs are masked anyway)
+PLAID_ID_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{30,}(?![A-Za-z0-9])")
 CURRENCY_RE = re.compile(r"[A-Z]{3}")
 TIMESTAMP_RE = re.compile(r"[0-9T:+.Z -]{1,40}")
 # normalised type keyword -> family; two account types are compatible when one contains the other or they share a family
@@ -110,7 +113,7 @@ class Backend:
         for secret in sorted((*self.tokens.values(), *self.tokens, *self._pids), key=len, reverse=True):
             if secret:
                 out = out.replace(secret, "[redacted]")
-        out = TOKEN_RE.sub("[redacted]", out)
+        out = PLAID_ID_RE.sub("[redacted]", TOKEN_RE.sub("[redacted]", out))
         return TOKEN_RE.sub("[redacted]", clean_text(out))
 
     def close(self) -> None:
