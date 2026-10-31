@@ -1115,3 +1115,29 @@ def test_ipv4_neighbours_in_one_24_do_not_share_the_in_flight_cap():
         return neighbour_sent
 
     assert asyncio.run(run())[0]["status"] == 200
+
+
+def test_one_ipv4_network_cannot_hold_unbounded_slots():
+    release = None
+
+    async def blocking(scope, receive, send):
+        await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        guard = Guard(blocking, RateLimiter(), Limits(), RESOURCE, anon_concurrency=1)
+        from app.remote import NET_CONCURRENCY_FACTOR as cap
+        calls = [_guard_call(guard, client=(f"203.0.113.{i + 1}", 1000)) for i in range(cap)]
+        tasks = [asyncio.create_task(c) for c, _ in calls]
+        await asyncio.sleep(0.01)
+        over, over_sent = _guard_call(guard, client=("203.0.113.200", 1000))
+        await over
+        release.set()
+        await asyncio.gather(*tasks)
+        return over_sent, guard
+
+    over, guard = asyncio.run(run())
+    assert over[0]["status"] == 429 and guard._in_flight == {}

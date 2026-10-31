@@ -1,3 +1,4 @@
+import os
 """systemd credentials backend with a fake credentials dir and a fake systemd-creds; plus the bundle move commands."""
 import base64
 import io
@@ -83,6 +84,8 @@ def test_admin_round_trip_through_systemd_creds(systemd, tmp_path):
     files = list((tmp_path / "credstore").iterdir())
     assert sorted(f.name for f in files) == ["plaid_client_id", "plaid_items_production", "plaid_secret_production"]
     assert not [f for f in files if b"VALUE" in f.read_bytes()]
+    if os.name == "posix":  # Windows has no POSIX modes
+        assert all((f.stat().st_mode & 0o777) == 0o600 for f in files)
 
 
 def test_invalid_credential_names_refused(systemd):

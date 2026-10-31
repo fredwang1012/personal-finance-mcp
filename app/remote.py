@@ -43,6 +43,7 @@ log = logging.getLogger("personal-finance-mcp.remote")
 MAX_BODY = 64 * 1024  # MCP requests here are tiny tool calls; DCR and token forms are smaller still
 BODY_TIMEOUT = 10.0  # seconds for the whole request body to arrive before answering 408
 ANON_CONCURRENCY = 4  # requests in flight at once per address (/24 or /64) without a bearer token
+NET_CONCURRENCY_FACTOR = 8  # per-/24 in-flight cap as a multiple of the per-address one
 LOOPBACK = ("127.0.0.1", "::1")
 MISCONFIGURED = {"error": "misconfigured_proxy", "error_description": "The proxy did not forward the client address."}
 TOOL_NAMES = frozenset(fn.__name__ for fn, _ in server.TOOLS)
@@ -281,17 +282,22 @@ class Guard:
         if bearer:  # limited per OAuth client in layer 2 once the token is checked
             return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
         # an IPv6 client controls a whole /64, so that is the unit; IPv4 stays per address so neighbours on a
-        # shared /24 (campus, CGNAT) cannot fill the owner's slots
-        slot = ip_bucket(ip) if ":" in ip else ip
-        if self._in_flight.get(slot, 0) >= self.anon_concurrency:
+        # shared /24 (campus, CGNAT) cannot fill the owner's slots; a looser per-network cap still stops one network
+        # from holding many slow connections
+        slots = [(ip_bucket(ip) if ":" in ip else ip, self.anon_concurrency)]
+        if ":" not in ip:
+            slots.append(("net:" + ip_bucket(ip), self.anon_concurrency * NET_CONCURRENCY_FACTOR))
+        if any(self._in_flight.get(k, 0) >= cap for k, cap in slots):
             return await _too_many(send, 1)
-        self._in_flight[slot] = self._in_flight.get(slot, 0) + 1
+        for k, _ in slots:
+            self._in_flight[k] = self._in_flight.get(k, 0) + 1
         try:
             return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
         finally:
-            self._in_flight[slot] -= 1
-            if not self._in_flight[slot]:
-                del self._in_flight[slot]
+            for k, _ in slots:
+                self._in_flight[k] -= 1
+                if not self._in_flight[k]:
+                    del self._in_flight[k]
 
     async def _admitted(self, scope, receive, send, path, method, ip, headers, bearer, unforwarded):
         try:

@@ -87,6 +87,7 @@ class SystemdCreds:
         if done.returncode != 0:
             tmp.unlink(missing_ok=True)
             raise MissingSecret(f"systemd-creds could not encrypt '{name}' (run as root on the server).")
+        os.chmod(tmp, 0o600)  # ciphertext, but keep it as private as the key that decrypts it
         os.replace(tmp, path)
 
     def delete(self, name: str) -> None:
