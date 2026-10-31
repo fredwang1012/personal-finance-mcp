@@ -1,6 +1,9 @@
-"""Command line: python -m app.cli set-plaid-keys | status | link [--update ITEM_SHORT_ID] | unlink | import-csv."""
+"""Command line: python -m app.cli set-plaid-keys | status | link [--update ITEM_SHORT_ID] | unlink | import-csv
+| serve-http | set-remote-secrets | export-bundle | import-bundle."""
 import argparse
 import getpass
+import json
+import secrets as pysecrets
 import sys
 
 from app import secrets
@@ -202,6 +205,88 @@ def unlink(short_id: str | None, local_only: bool = False) -> int:
     return run_unlink(lambda: RealPlaid.from_settings(settings), settings.plaid_env, short_id, local_only=local_only)
 
 
+BUNDLE_FORMAT = "personal-finance-mcp-bundle-1"
+MAX_BUNDLE = 64 * 1024
+
+
+def set_remote_secrets(rotate_signing_key: bool = False) -> int:
+    """Keychain only (laptop testing of serve-http). On the server use deploy/import-credential.sh."""
+    if settings.secrets_backend != "keyring":
+        print("On the server, store these with deploy/import-credential.sh (see docs/REMOTE.md).", file=sys.stderr)
+        return 1
+    print("Typing and pasting show nothing here. Leave empty to keep the stored value.")
+    github = getpass.getpass("GitHub OAuth App client secret: ").strip().strip('"')
+    if github:
+        secrets._set(secrets.GITHUB_SECRET, github)
+    elif not secrets.has_secret(secrets.GITHUB_SECRET):
+        print("No GitHub client secret stored yet; nothing changed.", file=sys.stderr)
+        return 1
+    if rotate_signing_key or not secrets.has_secret(secrets.SIGNING_KEY):
+        secrets._set(secrets.SIGNING_KEY, pysecrets.token_hex(32))
+        print("Generated a new token-signing key (every issued OAuth token and client is now invalid).")
+    print("Stored the remote connector secrets in the OS keychain.")
+    return 0
+
+
+def export_bundle(env: str, out=None) -> int:
+    """Write this environment's Plaid keys and access tokens as one JSON line, for piping straight into
+    `ssh ... import-bundle`. Refuses to write to a terminal, so the secrets never appear on screen."""
+    out = out or sys.stdout
+    if out.isatty():
+        print("Refusing to print secrets to a terminal. Pipe this into ssh; see docs/REMOTE.md.", file=sys.stderr)
+        return 1
+    try:
+        items = {i: secrets.get_access_token(env, i) for i in secrets.list_item_ids(env)}
+        bundle = {"format": BUNDLE_FORMAT, "env": env, "plaid_client_id": secrets.get_client_id(),
+                  "plaid_secret": secrets.get_plaid_secret(env), "items": items}
+    except secrets.MissingSecret:
+        # not the exception text: per-item messages name the keychain entry, which contains the raw item id
+        print("Export failed: a Plaid key or access token is missing. Run status to check.", file=sys.stderr)
+        return 1
+    out.write(json.dumps(bundle) + "\n")
+    out.flush()
+    print(f"Exported Plaid keys and {len(items)} item(s) for '{env}': "
+          f"{', '.join(short_hash(i) for i in items) or 'none'}.", file=sys.stderr)
+    return 0
+
+
+def import_bundle(env: str, inp=None) -> int:
+    """Read an export-bundle line from stdin and store it in the configured backend (systemd on the server)."""
+    inp = inp or sys.stdin
+    if settings.secrets_backend != "systemd":
+        print("import-bundle is for the server (SECRETS_BACKEND=systemd).", file=sys.stderr)
+        return 1
+    if inp.isatty():
+        print("import-bundle reads from a pipe, not the keyboard; see docs/REMOTE.md.", file=sys.stderr)
+        return 1
+    raw = inp.read(MAX_BUNDLE + 1)
+    try:
+        bundle = json.loads(raw) if len(raw) <= MAX_BUNDLE else None
+    except json.JSONDecodeError:
+        bundle = None
+    ok = (isinstance(bundle, dict) and bundle.get("format") == BUNDLE_FORMAT
+          and all(isinstance(bundle.get(k), str) and bundle.get(k) for k in ("env", "plaid_client_id", "plaid_secret"))
+          and isinstance(bundle.get("items"), dict)
+          and all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in bundle["items"].items()))
+    if not ok:
+        print("Input is not a valid export bundle; nothing stored.", file=sys.stderr)
+        return 1
+    if bundle["env"] != env:
+        print(f"Bundle is for '{bundle['env']}' but PLAID_ENV here is '{env}'; nothing stored.", file=sys.stderr)
+        return 1
+    try:
+        secrets.set_plaid_keys(env, bundle["plaid_client_id"], bundle["plaid_secret"])
+        for item_id, token in bundle["items"].items():
+            secrets.set_access_token(env, item_id, token)
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"Stored Plaid keys and {len(bundle['items'])} item(s) for '{env}': "
+          f"{', '.join(short_hash(i) for i in bundle['items']) or 'none'}. "
+          "Restart the service: sudo systemctl restart personal-finance-mcp")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -222,7 +307,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     csv_parser = sub.add_parser("import-csv", help="import Wealthsimple Activities / holdings CSV exports into the local store")
     csv_parser.add_argument("paths", nargs="+", help="CSV files downloaded from Wealthsimple")
+    http_parser = sub.add_parser("serve-http", help="serve the read-only tools over HTTPS-fronted Streamable HTTP with OAuth")
+    http_parser.add_argument("--port", type=int, help="port on 127.0.0.1 (default: HTTP_PORT setting, 8765)")
+    remote_parser = sub.add_parser("set-remote-secrets", help="store the GitHub client secret and a signing key (keychain)")
+    remote_parser.add_argument("--rotate-signing-key", action="store_true", help="replace the signing key")
+    sub.add_parser("export-bundle", help="write Plaid keys and tokens as JSON to a pipe (for moving them to the server)")
+    sub.add_parser("import-bundle", help="read an export bundle from a pipe into systemd credentials (server, as root)")
     args = parser.parse_args(argv)
+    if args.command == "serve-http":
+        from app import remote
+
+        if args.port:
+            settings.http_port = args.port
+        return remote.serve()
+    if args.command == "set-remote-secrets":
+        return set_remote_secrets(args.rotate_signing_key)
+    if args.command == "export-bundle":
+        return export_bundle(settings.plaid_env)
+    if args.command == "import-bundle":
+        return import_bundle(settings.plaid_env)
     if args.command == "import-csv":
         from app.csvimport import import_paths
 
