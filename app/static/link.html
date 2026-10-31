@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<title>Link Wealthsimple</title>
+</head>
+<body>
+<h1>Link Wealthsimple</h1>
+<p id="status">Loading Plaid Link...</p>
+<button id="open" hidden>Open Plaid Link</button>
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<script>
+const CFG = __CONFIG__;
+const statusEl = document.getElementById("status");
+const show = (text) => { statusEl.textContent = text; };
+
+async function sendPublicToken(publicToken) {
+  show("Finishing link...");
+  try {
+    const res = await fetch("/exchange", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({state: CFG.state, public_token: publicToken}),
+    });
+    show(res.ok ? "Linked. You can close this tab." : "Linking failed (HTTP " + res.status + "). See the terminal.");
+  } catch (e) {
+    show("Could not reach the local helper. See the terminal.");
+  }
+}
+
+// Update mode: the Item keeps its access token, so the public token is not sent anywhere
+async function reportUpdated() {
+  show("Finishing...");
+  try {
+    const res = await fetch("/complete", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({state: CFG.state}),
+    });
+    show(res.ok ? "Reconnected. You can close this tab." : "Reconnect failed (HTTP " + res.status + "). See the terminal.");
+  } catch (e) {
+    show("Could not reach the local helper. See the terminal.");
+  }
+}
+
+if (typeof Plaid === "undefined") {
+  show("Plaid Link failed to load. Check your connection and try again.");
+} else {
+  const handler = Plaid.create({
+    token: CFG.link_token,
+    onSuccess: (publicToken) => (CFG.update ? reportUpdated() : sendPublicToken(publicToken)),
+    onExit: () => show("Link closed. Press the button to try again."),
+  });
+  const button = document.getElementById("open");
+  button.hidden = false;
+  button.addEventListener("click", () => handler.open());
+  show("Ready.");
+  handler.open();
+}
+</script>
+</body>
+</html>
