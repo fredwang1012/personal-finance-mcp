@@ -9,8 +9,9 @@
 <h1>Link Wealthsimple</h1>
 <p id="status">Loading Plaid Link...</p>
 <button id="open" hidden>Open Plaid Link</button>
-<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
-<script>
+<script nonce="__NONCE__" src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<script nonce="__NONCE__">
+// relative URLs: the page is served under the helper's path secret, and so are its endpoints
 const CFG = __CONFIG__;
 const statusEl = document.getElementById("status");
 const show = (text) => { statusEl.textContent = text; };
@@ -18,7 +19,7 @@ const show = (text) => { statusEl.textContent = text; };
 async function sendPublicToken(publicToken) {
   show("Finishing link...");
   try {
-    const res = await fetch("/exchange", {
+    const res = await fetch("exchange", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({state: CFG.state, public_token: publicToken}),
@@ -33,7 +34,7 @@ async function sendPublicToken(publicToken) {
 async function reportUpdated() {
   show("Finishing...");
   try {
-    const res = await fetch("/complete", {
+    const res = await fetch("complete", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({state: CFG.state}),

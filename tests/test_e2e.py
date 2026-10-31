@@ -21,17 +21,16 @@ from app.config import ROOT
 
 TIMEOUT = 20  # seconds per response
 FAIL_KEYRING = "keyring.backends.fail.Keyring"
-TOOLS = {"list_accounts", "get_balances", "get_holdings", "get_transactions", "get_investment_transactions",
-         "net_worth", "allocation", "item_health"}
+TOOLS = {"accounts", "holdings", "transactions", "summary", "health"}
 
 
 class StdioClient:
-    def __init__(self, data_dir: Path, fake: bool = True, under_pytest: bool = True):
+    def __init__(self, data_dir: Path, fake: bool | str = True, under_pytest: bool = True):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("PLAID_", "PFMCP_", "PYTEST_"))}
         env.update(DATA_DIR=str(data_dir), PLAID_ENV="sandbox", PYTHON_KEYRING_BACKEND=FAIL_KEYRING,
                    PYTHONUNBUFFERED="1")
         if fake:
-            env["PFMCP_FAKE_PLAID"] = "1"
+            env["PFMCP_FAKE_PLAID"] = "1" if fake is True else fake
         if under_pytest:  # the guard also wants this; passed on explicitly rather than by inheritance
             env["PYTEST_CURRENT_TEST"] = os.environ["PYTEST_CURRENT_TEST"]
         self.proc = subprocess.Popen(
@@ -106,31 +105,60 @@ def test_stdio_server_end_to_end(client, tmp_path):
     for t in listed:
         a = t["annotations"]
         assert (a["readOnlyHint"], a["destructiveHint"], a["idempotentHint"], a["openWorldHint"]) == (
-            True, False, True, False), t["name"]
+            True, False, True, True), t["name"]
+    assert "untrusted" in init["result"]["instructions"]
 
-    call = client.request("tools/call", {"name": "list_accounts", "arguments": {}})["result"]
+    call = client.request("tools/call", {"name": "accounts", "arguments": {}})["result"]
     assert not call.get("isError")
-    payload = call.get("structuredContent") or json.loads(call["content"][0]["text"])
-    payload = payload.get("result", payload)
-    assert payload["accounts"] == [{
-        "id": payload["accounts"][0]["id"], "name": "TFSA", "type": "investment", "subtype": "tfsa", "mask": "0001",
-        "currency": "CAD", "source": "plaid",
-        "balances": {"current": "1234.56", "available": None, "limit": None, "basis": "reported_balance",
-                     "as_of": None},
-    }]
-    assert payload["notes"] == []  # no keychain failure note, so the in-memory keyring was used
+    assert "structuredContent" not in call and len(call["content"]) == 1  # one compact text block, nothing doubled
+    text = call["content"][0]["text"]
+    assert chr(10) not in text
+    payload = json.loads(text)
+    assert payload == {"accounts": [{
+        "id": payload["accounts"][0]["id"], "name": "TFSA", "type": "tfsa", "last4": "0001", "currency": "CAD",
+        "balance": "1234.56",
+    }]}  # no notes key: no keychain failure note, so the in-memory keyring was used
+    for name, args in [("holdings", {"detail": "full"}), ("transactions", {"detail": "full"}), ("summary", {}),
+                       ("health", {})]:
+        result = client.request("tools/call", {"name": name, "arguments": args})["result"]
+        assert not result.get("isError") and "error" not in json.loads(result["content"][0]["text"]), name
+        call["content"].append(result["content"][0])
     blob = json.dumps(call)
     assert testmode.FAKE_TOKEN not in blob and testmode.FAKE_ITEM not in blob and "fake-account" not in blob
     assert (tmp_path / "data" / "finance.db").exists()  # the store was created in the temp DATA_DIR only
 
 
+HOSTILE_MARKERS = [testmode.FAKE_TOKEN, testmode.FAKE_ITEM, "fake-account", "fake-secret", "fake-client-id",
+                   "evil.example", "access-sandbox"]  # injected phrases may remain, shortened
+
+
+def test_stdio_hostile_plaid_text_never_reaches_output(tmp_path):
+    c = StdioClient(tmp_path / "data", fake="hostile")
+    try:
+        handshake(c)
+        calls = [("accounts", {}), ("accounts", {"detail": "full"}), ("holdings", {}), ("holdings", {"detail": "full"}),
+                 ("transactions", {}), ("transactions", {"detail": "full", "limit": 200}), ("summary", {}),
+                 ("health", {})]
+        blob = ""
+        for name, args in calls:
+            result = c.request("tools/call", {"name": name, "arguments": args})["result"]
+            payload = json.loads(result["content"][0]["text"])
+            assert not result.get("isError") and "error" not in payload, name
+            blob += result["content"][0]["text"]
+        assert "Wealthsimple" not in blob or "WS" in blob  # the hostile fake really ran
+        assert '"security_type":"other"' in blob and "[link]" in blob and "[email]" in blob
+        for marker in HOSTILE_MARKERS:
+            assert marker not in blob, marker
+    finally:
+        c.close()
+
+
 def assert_fake_mode_off(c: StdioClient) -> None:
     # with the failing keyring backend the server reports a keychain problem instead of fake data
     handshake(c)
-    call = c.request("tools/call", {"name": "list_accounts", "arguments": {}})["result"]
-    payload = call.get("structuredContent") or json.loads(call["content"][0]["text"])
-    payload = payload.get("result", payload)
-    assert payload["accounts"] == []
+    call = c.request("tools/call", {"name": "accounts", "arguments": {}})["result"]
+    payload = json.loads(call["content"][0]["text"])
+    assert "accounts" not in payload
     assert any("Keychain or Plaid setup failed" in n for n in payload["notes"])
     assert b"PFMCP_FAKE_PLAID ignored" in b"".join(c.stderr)  # printed before the server answers
 

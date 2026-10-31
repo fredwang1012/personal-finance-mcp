@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from app import csvimport, store
+from app import csvimport, redact, store
 from app.cli import main
 
 FIX = Path(__file__).parent / "fixtures"
@@ -246,7 +246,7 @@ def test_free_text_sanitised_and_currency_validated(conn, tmp_path):
     res = csvimport.import_file(f, conn)
     assert res.added == 1 and res.rejected == [(3, "invalid currency")]
     desc = conn.execute("SELECT description FROM transactions").fetchone()[0]
-    assert len(desc) == 300 and "\x07" not in desc and "\x1b" not in desc
+    assert len(desc) == redact.MAX_TEXT and "\x07" not in desc and "\x1b" not in desc
 
 
 def test_size_cap(conn, tmp_path, monkeypatch):

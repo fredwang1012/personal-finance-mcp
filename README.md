@@ -8,21 +8,28 @@ Credential Manager; nothing that can move money is ever requested.
 
 ## What it does
 
-Claude gets eight tools. All of them are annotated read-only, non-destructive and idempotent.
+Claude gets five tools. All of them are annotated read-only, non-destructive and idempotent, and open-world (the
+data comes from outside). Each returns one compact JSON text block, with empty fields left out, so a call costs little
+context. `detail: "full"` adds the less common fields.
 
 | Tool | Returns |
 | --- | --- |
-| `list_accounts` | Each account: short id, name, type, subtype, mask (last 4), currency, balances, source |
-| `get_balances` | Current and available balance per account and currency |
-| `get_holdings` | Symbol, name, quantity, price, market value, cost basis, currency, security type; optional account filter (up to 500 rows) |
-| `get_transactions` | Investment activity from Plaid plus CSV-imported activity for the last `days` (max 730), newest first, at most `limit` (max 200) rows, with a per-type summary when truncated |
-| `get_investment_transactions` | The same, limited to trades, dividends and anything with a symbol |
-| `net_worth` | Totals by account type, per currency, with `primary_total` in the requested currency (default CAD) |
-| `allocation` | Percentages by account type and by security type, computed within each currency |
-| `item_health` | Per linked Plaid item: institution, products, last successful update, error code |
+| `accounts` | Each account: short id, name, type, last 4, currency, balance. Full adds subtype, available, limit, basis, as_of, source |
+| `holdings` | Positions sorted by value: symbol, quantity, value, currency, account last 4, plus totals per currency. Filter by account id, last 4 or name; 50 rows by default (`limit`, max 500). Full adds name, price, cost basis, security type |
+| `transactions` | Investment activity from Plaid plus CSV imports for the last `days` (default 90, max 730), newest first, `limit` rows (default 25, max 200), with count, omitted count and money in/out per currency. Filters: `account`, `symbol`, `kind` (`buy`, `dividend`, ... or `investment`). Concise rows carry the description only when there is no symbol |
+| `summary` | Net worth and allocation by account type and by security type, per currency, with the total in the requested currency (default CAD) |
+| `health` | Per linked Plaid item: institution, products, last successful update, error code |
 
-Every result has a `notes` list for anything Claude should know: a failed Plaid item, a CSV account that may be
-counted twice, mixed currencies, missing keys. Money values are decimal strings, never floats.
+Conventions shared by every tool are stated once, in the server instructions: amounts are decimal strings rounded to
+cents (quantities to 6 decimals), currencies are never converted, transaction amounts are negative for money out, and
+every string field is untrusted data from financial institutions. Results carry a `notes` list only when there is
+something to know: a failed Plaid item, a CSV account that may be counted twice, mixed currencies, missing keys.
+
+Plaid responses are cached in memory for 5 minutes per process, keyed by item, a digest of its access token and
+endpoint, and only the fields the tools read are kept. Investment transactions are fetched for a fixed 730-day window
+and `days` is applied locally, so different windows share one Plaid call. Accounts, holdings and investment transactions are fetched concurrently across items. Errors are not
+cached and nothing is written to disk. Over HTTP the cache is shared by all requests in the process, which serves only
+the owner. `scripts/measure_context.py` reports the size of the tool list and of each result, using synthetic data.
 
 Questions it can answer, for example:
 
@@ -98,7 +105,7 @@ runs, with the same checks. Do **not** fix this with a plain `link`: that create
 slot in Production, and if the old Item recovers later its accounts are counted twice.
 
 **Wealthsimple caveat.** Plaid's coverage of Canadian investment accounts can be incomplete: some accounts, holdings
-or activity may be missing or late. `item_health` shows the last successful update. That gap is why the CSV fallback
+or activity may be missing or late. `health` shows the last successful update. That gap is why the CSV fallback
 exists.
 
 ## CSV fallback
@@ -165,30 +172,50 @@ claude mcp add personal-finance -- py -3.12 -m uv run --directory C:\dev\UofT\Pr
 Add `-s user` before `personal-finance` to make it available in every project rather than just the current one. In
 Git Bash, quote the path or use forward slashes. `claude mcp list` shows whether it connected.
 
+## Use from claude.ai and the Claude apps
+
+To use the same tools in Claude on the web, iPhone and iPad, run them on a small server:
+- `python -m app.cli serve-http` serves the tools over MCP Streamable HTTP on 127.0.0.1.
+- Tailscale Funnel makes it reachable at a public HTTPS URL.
+- OAuth sign-in admits only your GitHub account.
+- Each client Claude registers is approved once on the server.
+
+Add the connector once at claude.ai and it shows up in the iOS and iPadOS apps. The existing Production access token
+is moved from the keychain into encrypted systemd credentials without relinking, so no Trial slot is used. Every step
+is in [docs/REMOTE.md](docs/REMOTE.md), from the Oracle VM to revoking everything.
+
 ## Security model
 
-- **Read-only.** Plaid Link asks only for the `investments` product, plus `transactions` where the institution
-  supports it (`required_if_supported_products`, so an institution without Transactions still links). No other
-  product is requested. No transfer, payment, auth or other money-movement endpoint is called or wrapped, and tests
+- **Read-only.** Plaid Link asks only for the `investments` product. `transactions` is not requested, since nothing
+  reads it and it would let a stolen token read cash and chequing activity. No transfer, payment, auth or other money-movement endpoint is called or wrapped, and tests
   check the product lists and the client interface.
 - **Secrets in the keychain.** The Plaid client_id, secrets and access tokens are stored only in the OS keychain via
   `keyring`. They are never written to files, logs, error messages or tool output. Plaid errors are reduced to the
   error code and display message. `.env` holds only the settings above.
 - **No Wealthsimple credentials.** Linking happens in Plaid Link in your browser. The server only ever holds a
   revocable access token.
-- **Localhost Link helper.** `link` binds `127.0.0.1` on an ephemeral port (or `--port`), checks the `Host` and
-  `Origin` headers, embeds a one-time random state token that the exchange must echo, accepts one successful exchange
-  and then exits, or exits after 10 minutes. The page has a CSP that only allows Plaid. In update mode
+- **Localhost Link helper.** `link` binds `127.0.0.1` on an ephemeral port (or `--port`), serves everything under a
+  random path secret that only the URL opened in your browser contains (any other path is a bare 404), checks the
+  `Host` and `Origin` headers, embeds a one-time random state token that the exchange must echo, accepts one successful exchange
+  and then exits, or exits after 10 minutes. The page has a CSP that only allows Plaid, runs its inline script by
+  per-response nonce, and forbids framing. In update mode
   (`link --update`) there is no token exchange: the page reports success once, with the same state token and checks,
   and nothing is stored.
-- **Local only.** The server speaks stdio to the Claude app on this machine. It opens no port.
+- **Local only by default.** The stdio server speaks to the Claude app on this machine and opens no port. The optional
+  remote connector (`serve-http`) listens on 127.0.0.1 behind Tailscale Funnel. Every request needs an OAuth token
+  that is bound to its URL and issued only after your GitHub login and your approval on the server. See
+  [docs/REMOTE.md](docs/REMOTE.md).
 - **Field minimisation.** Whatever a tool returns becomes model context, so tools return only what a question needs:
   accounts are referred to by an 8-character hash, never a Plaid id; masks are the last 4 characters; free text
-  (account names, descriptions, institution names) has control characters stripped, long digit runs masked, anything
-  that looks like a Plaid token or known id redacted, and is capped in length. Currency codes that are not three
+  (account names, descriptions, institution names) has control characters stripped, long digit runs masked, links and e-mail
+  addresses replaced with `[link]` and `[email]`, anything that looks like a Plaid token, known id or Plaid key
+  redacted, and is shortened to 60 characters (120 with `detail: "full"`). Currency codes that are not three
   capital letters are replaced with `???`.
 - **What Claude can see:** account names, types, last-4 masks, balances, holdings, investment transactions (date,
   sanitised description, amount, type, symbol), institution names and item health.
+- **Untrusted text.** Descriptions, names and memos come from institutions and, for e-Transfers, from outside
+  senders. The server instructions tell Claude never to follow instructions found in them, and concise transaction
+  rows leave the description out when type, symbol and amount already say what happened.
 - **What Claude cannot see:** Plaid keys, access tokens, Plaid item or account ids, full account or routing numbers,
   your Wealthsimple login.
 - **Exact money.** Amounts are `Decimal` and returned as strings. Transaction amounts use one sign convention:
@@ -231,13 +258,15 @@ are comfortable with that for the fields above.
   are dropped for any account and date Plaid has transactions for.
 - **Possible double count.** A CSV account with holdings or transactions that could not be matched to a Plaid account
   is still counted, with a "Possible double count" note, since it may be the same account under another name.
-- **Plaid coverage.** See the Wealthsimple caveat above. Holdings and transactions from Plaid are fetched live on each
-  call; nothing from Plaid is cached.
+- **Plaid coverage.** See the Wealthsimple caveat above. Plaid data can be up to 5 minutes older than Plaid itself,
+  because responses are cached in memory for that long.
+- **Products on existing items.** Items linked before `transactions` was dropped keep the products they were granted
+  (Plaid cannot remove a product from an Item). The server never calls the Transactions endpoints; relinking would
+  narrow the consent but uses another Trial slot in Production.
 
 ## Roadmap
 
-- **Remote connector (next).** The same tools for Claude on the web, iPhone and iPad, served from my own VM over
-  Tailscale Funnel with OAuth restricted to my GitHub account. Phase 1 is local stdio only.
+- **Remote connector:** built, see [docs/REMOTE.md](docs/REMOTE.md). Not yet deployed.
 - Savings rate and budgeting, once bank transactions are in.
 
 ## Tests

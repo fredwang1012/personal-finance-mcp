@@ -1,6 +1,10 @@
-"""Command line: python -m app.cli set-plaid-keys | status | link [--update ITEM_SHORT_ID] | unlink | import-csv."""
+"""Command line: python -m app.cli set-plaid-keys | status | link [--update ITEM_SHORT_ID] | unlink | import-csv
+| serve-http | set-remote-secrets | bundle-key | export-bundle | import-bundle
+| list-clients | approve-client | revoke-client."""
 import argparse
 import getpass
+import json
+import secrets as pysecrets
 import sys
 
 from app import secrets
@@ -20,7 +24,7 @@ def set_plaid_keys() -> int:
         print("Both values are required; nothing stored.", file=sys.stderr)
         return 1
     secrets.set_plaid_keys(settings.plaid_env, client_id, secret)
-    print(f"Stored Plaid keys for '{settings.plaid_env}' in the OS keychain.")
+    print(f"Stored Plaid keys for '{settings.plaid_env}' ({settings.secrets_backend} backend).")
     # enough to spot a failed paste without showing the secret: Plaid client ids are 24 characters, secrets 30
     print(f"Check: client_id ends in ...{client_id[-4:]} ({len(client_id)} characters); "
           f"secret has {len(secret)} characters.")
@@ -114,7 +118,7 @@ def _delete_locally(env: str, item_id: str, short: str, after_plaid: bool) -> in
         where = f"Item {short} removed at Plaid; local" if after_plaid else f"Item {short}: local"
         print(f"{where} cleanup failed ({type(exc).__name__}), run unlink again to finish.")
         return 1
-    print("Deleted its access token and list entry from the OS keychain.")
+    print(f"Deleted its access token and list entry (secrets backend: {settings.secrets_backend}).")
     return 0
 
 
@@ -202,6 +206,184 @@ def unlink(short_id: str | None, local_only: bool = False) -> int:
     return run_unlink(lambda: RealPlaid.from_settings(settings), settings.plaid_env, short_id, local_only=local_only)
 
 
+BUNDLE_FORMAT = "personal-finance-mcp-bundle-1"
+MAX_BUNDLE = 64 * 1024
+
+
+def set_remote_secrets(rotate_signing_key: bool = False) -> int:
+    """Keychain only (laptop testing of serve-http). On the server use deploy/import-credential.sh."""
+    if settings.secrets_backend != "keyring":
+        print("On the server, store these with deploy/import-credential.sh (see docs/REMOTE.md).", file=sys.stderr)
+        return 1
+    print("Typing and pasting show nothing here. Leave empty to keep the stored value.")
+    github = getpass.getpass("GitHub OAuth App client secret: ").strip().strip('"')
+    if github:
+        secrets._set(secrets.GITHUB_SECRET, github)
+    elif not secrets.has_secret(secrets.GITHUB_SECRET):
+        print("No GitHub client secret stored yet; nothing changed.", file=sys.stderr)
+        return 1
+    if rotate_signing_key or not secrets.has_secret(secrets.SIGNING_KEY):
+        secrets._set(secrets.SIGNING_KEY, pysecrets.token_hex(32))
+        print("Generated a new token-signing key (every issued OAuth token and client is now invalid).")
+    print("Stored the remote connector secrets in the OS keychain.")
+    return 0
+
+
+BUNDLE_KEY = "bundle_private_key"
+
+
+def bundle_key() -> int:
+    """Server: make a one-time keypair for import-bundle; store the private half, print only the public half."""
+    from app.bundle import generate_keypair
+
+    private, public = generate_keypair()
+    try:
+        secrets._set(BUNDLE_KEY, private)
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print("Public key for export-bundle --to (safe to copy; it is deleted again after a successful import):")
+    print(public)
+    return 0
+
+
+def export_bundle(env: str, to: str | None, out=None) -> int:
+    """Laptop: write this environment's Plaid keys and access tokens sealed to the server's public key.
+    The output is ciphertext only, so it is harmless on a terminal or in a file."""
+    from app.bundle import BundleError, seal
+
+    out = out or sys.stdout
+    if not to:
+        print("export-bundle needs --to KEY, the public key printed by `bundle-key` on the server. It never writes "
+              "the secrets unencrypted.", file=sys.stderr)
+        return 1
+    try:
+        items = {i: secrets.get_access_token(env, i) for i in secrets.list_item_ids(env)}
+        bundle = {"format": BUNDLE_FORMAT, "env": env, "plaid_client_id": secrets.get_client_id(),
+                  "plaid_secret": secrets.get_plaid_secret(env), "items": items}
+    except secrets.MissingSecret:
+        # not the exception text: per-item messages name the keychain entry, which contains the raw item id
+        print("Export failed: a Plaid key or access token is missing. Run status to check.", file=sys.stderr)
+        return 1
+    try:
+        sealed = seal(to, json.dumps(bundle).encode())
+    except BundleError as exc:
+        print(f"Export failed: {exc}.", file=sys.stderr)
+        return 1
+    out.write(sealed + "\n")
+    out.flush()
+    print(f"Sealed Plaid keys and {len(items)} item(s) for '{env}': "
+          f"{', '.join(short_hash(i) for i in items) or 'none'}.", file=sys.stderr)
+    return 0
+
+
+def import_bundle(env: str, inp=None) -> int:
+    """Server: read a sealed bundle (pipe or paste), decrypt it with the bundle-key private half and store it."""
+    from app.bundle import BundleError, open_sealed
+
+    inp = inp or sys.stdin
+    if settings.secrets_backend != "systemd":
+        print("import-bundle is for the server (SECRETS_BACKEND=systemd).", file=sys.stderr)
+        return 1
+    try:
+        private = secrets.backend().get(BUNDLE_KEY)
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if not private:
+        print("No bundle key here. Run `bundle-key` first and export with its public key.", file=sys.stderr)
+        return 1
+    raw = inp.readline(MAX_BUNDLE + 1)
+    try:
+        if len(raw) > MAX_BUNDLE:
+            raise BundleError("input too large")
+        bundle = json.loads(open_sealed(private, raw))
+    except BundleError as exc:
+        print(f"Nothing stored: {exc}.", file=sys.stderr)
+        return 1
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        bundle = None
+    ok = (isinstance(bundle, dict) and bundle.get("format") == BUNDLE_FORMAT
+          and all(isinstance(bundle.get(k), str) and bundle.get(k) for k in ("env", "plaid_client_id", "plaid_secret"))
+          and isinstance(bundle.get("items"), dict)
+          and all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in bundle["items"].items()))
+    if not ok:
+        print("Input is not a valid export bundle; nothing stored.", file=sys.stderr)
+        return 1
+    if bundle["env"] != env:
+        print(f"Bundle is for '{bundle['env']}' but PLAID_ENV here is '{env}'; nothing stored.", file=sys.stderr)
+        return 1
+    try:
+        secrets.set_plaid_keys(env, bundle["plaid_client_id"], bundle["plaid_secret"])
+        for item_id, token in bundle["items"].items():
+            secrets.set_access_token(env, item_id, token)
+        secrets._delete(BUNDLE_KEY)  # one-time key: a copy of the ciphertext is useless from now on
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"Stored Plaid keys and {len(bundle['items'])} item(s) for '{env}': "
+          f"{', '.join(short_hash(i) for i in bundle['items']) or 'none'}. Deleted the one-time bundle key. "
+          "Restart the service: sudo systemctl restart personal-finance-mcp")
+    return 0
+
+
+def _client_admin():
+    from app.auth import ClientAdmin
+
+    return ClientAdmin(settings.data_dir / "oauth.db")
+
+
+def list_clients() -> int:
+    admin = _client_admin()
+    try:
+        rows = admin.rows()
+        used, cap = admin.counts()
+    finally:
+        admin.close()
+    if rows:
+        print(f"{'fingerprint':<12} {'status':<9} {'registered':<24} {'last used':<24} name")
+        for r in rows:
+            print(f"{r['fingerprint']:<12} {r['status']:<9} {r['registered']:<24} {r['last_used']:<24} "
+                  f"{clean_text(r['name'])}")
+    else:
+        print("No registered OAuth clients.")
+    # pending clients expire on their own; approved ones stay until revoked, and revoked ones linger 30 days
+    print(f"{used} of {cap} client slots used. Revoke approved clients you no longer use with "
+          "`revoke-client FINGERPRINT`.")
+    return 0
+
+
+def approve_client(fp: str) -> int:
+    admin = _client_admin()
+    try:
+        done = admin.approve(fp)
+    finally:
+        admin.close()
+    if done is None:
+        print("No single pending client has that fingerprint (pending requests expire after 30 minutes). "
+              "Run list-clients.", file=sys.stderr)
+        return 1
+    print(f"Approved client {done}. Click Connect in Claude again to finish.")
+    return 0
+
+
+def revoke_client(fp: str | None, everything: bool = False) -> int:
+    admin = _client_admin()
+    try:
+        if everything:
+            n = admin.revoke_all()
+            print(f"Revoked {n} client(s) and deleted every token.")
+            return 0
+        done = admin.revoke(fp or "")
+    finally:
+        admin.close()
+    if done is None:
+        print("No single active client has that fingerprint. Run list-clients.", file=sys.stderr)
+        return 1
+    print(f"Revoked client {done} and deleted all of its tokens.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -222,7 +404,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     csv_parser = sub.add_parser("import-csv", help="import Wealthsimple Activities / holdings CSV exports into the local store")
     csv_parser.add_argument("paths", nargs="+", help="CSV files downloaded from Wealthsimple")
+    http_parser = sub.add_parser("serve-http", help="serve the read-only tools over HTTPS-fronted Streamable HTTP with OAuth")
+    http_parser.add_argument("--port", type=int, help="port on 127.0.0.1 (default: HTTP_PORT setting, 8765)")
+    remote_parser = sub.add_parser("set-remote-secrets", help="store the GitHub client secret and a signing key (keychain)")
+    remote_parser.add_argument("--rotate-signing-key", action="store_true", help="replace the signing key")
+    sub.add_parser("bundle-key", help="server: make a one-time key for import-bundle and print its public half")
+    export_parser = sub.add_parser("export-bundle", help="laptop: write Plaid keys and tokens sealed to the server's key")
+    export_parser.add_argument("--to", metavar="KEY", help="public key printed by bundle-key on the server")
+    sub.add_parser("import-bundle", help="server: decrypt a sealed bundle into systemd credentials (as root)")
+    sub.add_parser("list-clients", help="list OAuth clients of the remote connector (fingerprint, status, use)")
+    sub.add_parser("approve-client", help="approve one pending OAuth client").add_argument(
+        "fingerprint", help="8-character fingerprint from list-clients")
+    revoke_parser = sub.add_parser("revoke-client", help="revoke an OAuth client and delete its tokens")
+    revoke_parser.add_argument("fingerprint", nargs="?", help="8-character fingerprint from list-clients")
+    revoke_parser.add_argument("--all", action="store_true", help="revoke every client and delete every token")
     args = parser.parse_args(argv)
+    if args.command == "list-clients":
+        return list_clients()
+    if args.command == "approve-client":
+        return approve_client(args.fingerprint)
+    if args.command == "revoke-client":
+        if bool(args.all) == bool(args.fingerprint):
+            parser.error("give a FINGERPRINT or --all")
+        return revoke_client(args.fingerprint, args.all)
+    if args.command == "serve-http":
+        from app import remote
+
+        if args.port:
+            settings.http_port = args.port
+        return remote.serve()
+    if args.command == "set-remote-secrets":
+        return set_remote_secrets(args.rotate_signing_key)
+    if args.command == "bundle-key":
+        return bundle_key()
+    if args.command == "export-bundle":
+        return export_bundle(settings.plaid_env, args.to)
+    if args.command == "import-bundle":
+        return import_bundle(settings.plaid_env)
     if args.command == "import-csv":
         from app.csvimport import import_paths
 

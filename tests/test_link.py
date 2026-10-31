@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 import threading
 import time
@@ -11,7 +12,7 @@ import keyring
 
 from app import link, secrets
 from app.redact import short_hash
-from app.plaid_client import PRODUCTS, REQUIRED_IF_SUPPORTED_PRODUCTS, PlaidError
+from app.plaid_client import PRODUCTS, PlaidError
 
 
 class FakePlaid:
@@ -43,7 +44,10 @@ def helper():
 
 
 def request(server, path="/exchange", body=None, host=None, content_type="application/json", method="POST",
-            origin=None):
+            origin=None, raw=False):
+    """Paths are under the helper's path secret unless raw=True."""
+    if not raw:
+        path = server.route(path.lstrip("/"))
     headers = {"Host": host or f"127.0.0.1:{server.port}"}
     if origin is not None:
         headers["Origin"] = origin
@@ -58,8 +62,8 @@ def request(server, path="/exchange", body=None, host=None, content_type="applic
         return err.code, err.read()
 
 
-def test_products_are_read_only_pair():
-    assert PRODUCTS + REQUIRED_IF_SUPPORTED_PRODUCTS == ["investments", "transactions"]
+def test_products_are_investments_only():
+    assert PRODUCTS == ["investments"]
 
 
 def test_binds_loopback_and_page_embeds_state(helper):
@@ -203,7 +207,28 @@ def test_page_has_csp_allowing_only_plaid(helper):
     req = urllib.request.Request(server.url, headers={"Host": f"127.0.0.1:{server.port}"})
     with urllib.request.urlopen(req, timeout=5) as resp:
         csp = resp.headers["Content-Security-Policy"]
+        page = resp.read().decode()
     assert "default-src 'none'" in csp and "https://cdn.plaid.com" in csp
+    assert "frame-ancestors 'none'" in csp and "'unsafe-inline'" not in csp.split("script-src")[1].split(";")[0]
+    nonce = re.search(r"'nonce-([\w-]+)'", csp).group(1)
+    assert page.count(f'<script nonce="{nonce}"') == 2 and "__NONCE__" not in page
+    with urllib.request.urlopen(urllib.request.Request(server.url), timeout=5) as resp:
+        assert nonce not in resp.headers["Content-Security-Policy"]  # fresh per response
+
+
+def test_every_route_needs_the_path_secret(helper):
+    server, fake, _ = helper
+    assert server.url.endswith(server.route()) and len(server.path_secret) >= 24
+    good = {"state": server.state, "public_token": "public-x"}
+    for path in ("/", "/exchange", "/complete", "/link.html", f"/{server.path_secret}", f"/x{server.path_secret}/",
+                 f"/{server.path_secret}/x", f"/{server.path_secret[:-1]}/"):
+        status, body = request(server, path, method="GET", content_type=None, raw=True)
+        assert (status, body) == (404, b"not found"), path
+        assert server.state.encode() not in body and b"link-sandbox" not in body
+    for path in ("/exchange", f"/{server.path_secret[:-1]}/exchange", f"/{server.path_secret}/complete"):
+        assert request(server, path, body=good, raw=True)[0] == 404, path
+    assert fake.exchanged == []
+    assert request(server, body=good)[0] == 200
 
 
 def test_idle_socket_does_not_stall_server(helper):

@@ -1,7 +1,9 @@
 """Short-lived localhost helper that hosts Plaid Link so the owner can link Wealthsimple in their own browser.
 
 Binds 127.0.0.1 on an ephemeral port, serves one page, accepts one successful token exchange, then exits
-(or exits after a timeout). The owner's credentials and 2FA only ever go to Plaid inside Plaid Link.
+(or exits after a timeout). Every route sits under a random path secret that only the URL opened in the owner's
+browser contains, so another local process cannot fetch the page (with its state and link token) or post to it;
+any other path gets a bare 404. The owner's credentials and 2FA only ever go to Plaid inside Plaid Link.
 
 In update mode (re-authenticating an existing Item) there is nothing to exchange: the page only reports success,
 once, and nothing new is stored.
@@ -16,17 +18,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from app import secrets
+from app.config import settings
 from app.plaid_client import PlaidAPI, PlaidError
 from app.redact import short_hash
 
 PAGE = Path(__file__).parent / "static" / "link.html"
 TIMEOUT_SECONDS = 600
 _MAX_BODY = 8192
-# What Plaid Link needs: its script and iframe from cdn.plaid.com, and calls to *.plaid.com
+# What Plaid Link needs: its script and iframe from cdn.plaid.com, and calls to *.plaid.com. The page's own inline
+# script runs only with the per-response nonce, and no other site may frame the page.
 CSP = (
-    "default-src 'none'; script-src 'self' https://cdn.plaid.com 'unsafe-inline'; "
+    "default-src 'none'; script-src https://cdn.plaid.com 'nonce-{nonce}'; "
     "connect-src 'self' https://*.plaid.com; frame-src https://cdn.plaid.com https://*.plaid.com; "
-    "style-src 'unsafe-inline'; img-src https://*.plaid.com data:"
+    "style-src 'unsafe-inline'; img-src https://*.plaid.com data:; frame-ancestors 'none'"
 )
 
 
@@ -59,6 +63,7 @@ class LinkServer(ThreadingHTTPServer):
         self.link_token = link_token
         self.update_item = update_item  # set in update mode: the existing Item being re-authenticated
         self.state = pysecrets.token_urlsafe(32)
+        self.path_secret = pysecrets.token_urlsafe(24)
         self.item_id: str | None = None
         self._lock = threading.Lock()
         self._exchanged = False
@@ -69,7 +74,10 @@ class LinkServer(ThreadingHTTPServer):
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/"
+        return f"http://127.0.0.1:{self.port}/{self.path_secret}/"
+
+    def route(self, name: str = "") -> str:
+        return f"/{self.path_secret}/{name}"
 
     def allowed_hosts(self) -> set[str]:
         return {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
@@ -132,12 +140,14 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - silence default request logging
         pass
 
-    def _send(self, status: int, body: bytes = b"", content_type: str = "text/plain; charset=utf-8") -> None:
+    def _send(self, status: int, body: bytes = b"", content_type: str = "text/plain; charset=utf-8",
+              nonce: str | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", CSP)
+        # without a nonce (every response but the page) no inline script may run at all
+        self.send_header("Content-Security-Policy", CSP.format(nonce=nonce or pysecrets.token_urlsafe(16)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
@@ -149,19 +159,21 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._send(400, b"bad host")
-        if self.path != "/":
+        if not hmac.compare_digest(self.path.encode(), self.server.route().encode()):
             return self._send(404, b"not found")
+        nonce = pysecrets.token_urlsafe(16)
         config = json.dumps({"state": self.server.state, "link_token": self.server.link_token,
                              "update": self.server.update_item is not None})
         config = config.replace("<", "\\u003c")  # keep the JSON from closing the script element
-        page = PAGE.read_text(encoding="utf-8").replace("__CONFIG__", config)
-        self._send(200, page.encode(), "text/html; charset=utf-8")
+        page = PAGE.read_text(encoding="utf-8").replace("__NONCE__", nonce).replace("__CONFIG__", config)
+        self._send(200, page.encode(), "text/html; charset=utf-8", nonce)
 
     def do_POST(self):
         if not self._host_ok():
             return self._send(400, b"bad host")
         update = self.server.update_item is not None
-        if self.path != ("/complete" if update else "/exchange"):
+        expected = self.server.route("complete" if update else "exchange")
+        if not hmac.compare_digest(self.path.encode(), expected.encode()):
             return self._send(404, b"not found")
         origin = self.headers.get("Origin")
         if origin is not None and origin.removeprefix("http://") not in self.server.allowed_hosts():
@@ -199,7 +211,7 @@ class _Handler(BaseHTTPRequestHandler):
         except PlaidError as exc:
             print(f"Plaid rejected the link: {exc.code}")
             return self._send(502, b"exchange failed")
-        print(f"Linked item {short_hash(item_id)}. Token stored in the OS keychain.")
+        print(f"Linked item {short_hash(item_id)}. Token stored ({settings.secrets_backend} backend).")
         self.server.stop_soon()  # before replying, so a broken pipe cannot keep the helper alive
         self._send(200, b'{"ok": true}', "application/json")
 

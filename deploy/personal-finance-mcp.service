@@ -1,0 +1,62 @@
+# Read-only remote connector for claude.ai. Installed by deploy/setup.sh; see docs/REMOTE.md.
+# Listens on 127.0.0.1 only; Tailscale Funnel forwards public HTTPS to it.
+[Unit]
+Description=personal-finance-mcp remote connector (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pfmcp
+Group=pfmcp
+WorkingDirectory=/opt/personal-finance-mcp
+EnvironmentFile=/etc/personal-finance-mcp/env
+ExecStart=/opt/personal-finance-mcp/.venv/bin/python -m app.cli serve-http
+Restart=on-failure
+RestartSec=5
+
+# Secrets: encrypted with the host key by `systemd-creds encrypt` (deploy/import-credential.sh or
+# `pfmcp import-bundle`), decrypted by systemd into $CREDENTIALS_DIRECTORY, readable only by this service.
+LoadCredentialEncrypted=plaid_client_id:/etc/credstore.encrypted/personal-finance-mcp/plaid_client_id
+LoadCredentialEncrypted=plaid_secret_production:/etc/credstore.encrypted/personal-finance-mcp/plaid_secret_production
+LoadCredentialEncrypted=plaid_items_production:/etc/credstore.encrypted/personal-finance-mcp/plaid_items_production
+LoadCredentialEncrypted=github_client_secret:/etc/credstore.encrypted/personal-finance-mcp/github_client_secret
+LoadCredentialEncrypted=token_signing_key:/etc/credstore.encrypted/personal-finance-mcp/token_signing_key
+
+# State (local SQLite store, OAuth client and token digests, audit log)
+StateDirectory=personal-finance-mcp
+StateDirectoryMode=0700
+UMask=0077
+
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=1024
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

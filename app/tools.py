@@ -5,29 +5,70 @@ Rules every tool follows:
   * Only needed fields are returned. Account ids are short local hashes, never Plaid ids, tokens or full numbers.
   * Money values are Decimal strings; currencies are never converted.
   * Plaid failures become short notes (code + display message); other sources still answer.
+  * Output is compact: money rounded to cents, quantities to 6 decimals, empty fields dropped, free text shortened
+    (after it has been sanitised) to CONCISE_TEXT or FULL_TEXT characters.
 Amount sign convention for transactions: negative = cash out of the account, positive = cash in. Plaid reports the
 opposite for investment transactions, so its sign is flipped to match the CSV exports.
+
+Plaid responses are cached per process (PlaidCache) as raw responses keyed by item, token digest, endpoint and
+arguments; every call still runs the full clean-and-merge pipeline on them, so caching changes no output.
 """
+import copy
+import hashlib
 import re
 import sqlite3
+import threading
+import time
+import unicodedata
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable
 
 from app import store
 from app.csvimport import _activity_type
 from app.plaid_client import PlaidAPI, PlaidError
-from app.redact import clean_text, short_hash
+from app.redact import clean_text, cut, short_hash
 
 MAX_DAYS = 730
 MAX_LIMIT = 200
 MAX_HOLDINGS = 500
+DEFAULT_HOLDINGS = 50
+CONCISE_TEXT = 60
+FULL_TEXT = 120
+CACHE_TTL = 300  # seconds
+MAX_WORKERS = 8
+UNCACHED = {"item_get"}  # health should reflect the connection right now
+MAX_SYMBOL = 12
+MAX_KIND = 24
+# Plaid's documented enums; anything else (a hostile or new value) is shown as "other" rather than echoed
+SECURITY_TYPES = {"cash", "cryptocurrency", "derivative", "equity", "etf", "fixed income", "loan", "mutual fund",
+                  "other"}
+PLAID_TX_TYPES = {"cancel", "cash"}  # the documented types _activity_type does not already map
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Only these fields of each Plaid response are ever read, so only these are kept in the cache
+KEEP = {
+    "accounts_get": {"accounts": ("account_id", "name", "official_name", "type", "subtype", "mask", "balances")},
+    "investments_holdings_get": {
+        "holdings": ("account_id", "security_id", "quantity", "institution_price", "institution_value", "cost_basis",
+                     "iso_currency_code", "institution_price_as_of"),
+        "securities": ("security_id", "ticker_symbol", "name", "type", "iso_currency_code"),
+    },
+    "investments_transactions_get": {
+        "investment_transactions": ("account_id", "security_id", "date", "name", "amount", "type", "subtype",
+                                    "iso_currency_code"),
+        "securities": ("security_id", "ticker_symbol"),
+    },
+}
 LIABILITY_TYPES = {"credit", "loan"}
 INVESTMENT_TYPES = {"buy", "sell", "dividend"}
 LINK_CMD = "python -m app.cli link"
 TOKEN_RE = re.compile(r"(?:access|link|public)-[a-z]+-[\w-]+")
+# Plaid item and account ids are long letter-digit runs (37 characters); nothing a tool should show looks like that,
+# and amounts never do (they have at most a few dozen digits with separators, and digit runs are masked anyway)
+PLAID_ID_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{30,}(?![A-Za-z0-9])")
 CURRENCY_RE = re.compile(r"[A-Z]{3}")
 TIMESTAMP_RE = re.compile(r"[0-9T:+.Z -]{1,40}")
 # normalised type keyword -> family; two account types are compatible when one contains the other or they share a family
@@ -54,10 +95,6 @@ def _str(d: Decimal | None) -> str | None:
 
 def _norm(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
-
-
-def _public(row: dict) -> dict:
-    return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
 def _reauth_hint(short: str) -> str:
@@ -88,8 +125,42 @@ def _currency(raw: Any, notes: list[str]) -> str | None:
     return "???"
 
 
-def _clamp(value: int, high: int) -> int:
-    return max(1, min(int(value), high))
+def _clamp(value: int, high: int, low: int = 1) -> int:
+    return max(low, min(int(value), high))
+
+
+class PlaidCache:
+    """Per-process, in-memory cache of raw Plaid responses with a TTL. Thread-safe; never written to disk.
+
+    Keys hold the item id, a digest of its access token (never the token), the endpoint and its arguments, so one
+    item's data can never be served for another, and a re-linked item with a new token misses. Failed calls are not
+    stored. Callers get deep copies, so nothing a tool does can change a cached response.
+    """
+
+    def __init__(self, ttl: float = CACHE_TTL, clock: Callable[[], float] = time.monotonic):
+        self.ttl, self.clock = ttl, clock
+        self._data: dict[tuple, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(item_id: str, token: str, endpoint: str, args: tuple) -> tuple:
+        return (item_id, hashlib.sha256(token.encode()).hexdigest(), endpoint, *args)
+
+    def get(self, key: tuple, fetch: Callable[[], Any]) -> Any:
+        with self._lock:
+            hit = self._data.get(key)
+            if hit and self.clock() - hit[0] < self.ttl:
+                return copy.deepcopy(hit[1])
+        value = fetch()  # an exception propagates and nothing is stored
+        with self._lock:
+            now = self.clock()
+            self._data = {k: v for k, v in self._data.items() if now - v[0] < self.ttl}
+            self._data[key] = (now, value)
+        return copy.deepcopy(value)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
 
 
 @dataclass
@@ -101,22 +172,61 @@ class Backend:
     tokens: dict[str, str] = field(default_factory=dict)  # item_id -> access token (never emitted)
     setup_notes: list[str] = field(default_factory=list)
     today: Callable[[], date] = date.today
+    cache: PlaidCache | None = None  # shared across calls by the server; None fetches every time
+    secrets: tuple[str, ...] = ()  # Plaid client id and secret, redacted from free text as defence in depth
     _pids: set[str] = field(default_factory=set)  # Plaid account ids seen so far; scrubbed from free text
 
     def clean(self, raw: Any) -> str:
         """Sanitise free text from Plaid and remove anything that looks like a token or a known id."""
-        # redact on the raw string first: clean_text masks digit runs, which would hide a token from exact matching
-        out = str(raw or "")
-        for secret in sorted((*self.tokens.values(), *self.tokens, *self._pids), key=len, reverse=True):
-            if secret:
-                out = out.replace(secret, "[redacted]")
-        out = TOKEN_RE.sub("[redacted]", out)
-        return TOKEN_RE.sub("[redacted]", clean_text(out))
+        # order matters: invisible characters go first (a zero-width space could split a secret), then exact secrets on
+        # the raw string (clean_text masks digit runs, which would hide a token from exact matching), then token- and
+        # id-shaped runs, then text cleaning (links, e-mails, digits, length), then the secret and shape passes again
+        out = "".join(ch for ch in str(raw or "") if unicodedata.category(ch) not in ("Cc", "Cf"))
+        out = PLAID_ID_RE.sub("[redacted]", TOKEN_RE.sub("[redacted]", self._redact_known(out)))
+        out = self._redact_known(clean_text(out))
+        return PLAID_ID_RE.sub("[redacted]", TOKEN_RE.sub("[redacted]", out))
+
+    def _redact_known(self, text: str) -> str:
+        known = (*self.tokens.values(), *self.tokens, *self.secrets, *self._pids)
+        for secret in sorted(known, key=len, reverse=True):
+            if len(secret) >= 6:  # real ids, tokens and keys are far longer; a stray short value must not shred text
+                text = text.replace(secret, "[redacted]")
+        return text
 
     def close(self) -> None:
         self.conn.close()
 
     # ---- gathering -------------------------------------------------------------------------------------------
+
+    def _call(self, item_id: str, endpoint: str, args: tuple = ()) -> Any:
+        token = self.tokens[item_id]
+        fetch = lambda: _minimise(endpoint, getattr(self.api, endpoint)(token, *args))  # noqa: E731
+        if self.cache is None or endpoint in UNCACHED:
+            return fetch()
+        return self.cache.get(PlaidCache.key(item_id, token, endpoint, args), fetch)
+
+    def _fetch_all(self, jobs: list[tuple[str, str, tuple]]) -> dict[tuple[str, str], Any]:
+        """Run (item_id, endpoint, args) Plaid calls concurrently. Each result is the response or the exception."""
+
+        def run(job):
+            try:
+                return self._call(*job)
+            except Exception as exc:  # reported per item by the caller
+                return exc
+
+        if len(jobs) <= 1:
+            results = [run(j) for j in jobs]
+        else:
+            with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(jobs))) as pool:
+                results = list(pool.map(run, jobs))
+        return {(item, endpoint): r for (item, endpoint, _), r in zip(jobs, results)}
+
+    def _learn_ids(self, results: dict[tuple[str, str], Any]) -> None:
+        # every account id is learned before any text is cleaned, so one item's error message cannot leak an id
+        # that only another item's response revealed
+        for (_, endpoint), r in results.items():
+            if endpoint == "accounts_get" and isinstance(r, dict):
+                self._pids.update(a["account_id"] for a in r.get("accounts", []) if a.get("account_id"))
 
     def _load_plaid(self, notes: list[str], holdings: bool = False, tx_range: tuple[date, date] | None = None):
         accounts: list[dict] = []
@@ -124,23 +234,30 @@ class Backend:
         txs: list[dict] = []
         if not self.api:
             return accounts, held, txs
-        for item_id, token in self.tokens.items():
+        endpoints = [("accounts_get", ())]
+        if holdings:
+            endpoints.append(("investments_holdings_get", ()))
+        if tx_range:
+            endpoints.append(("investments_transactions_get", tuple(tx_range)))
+        results = self._fetch_all([(item, ep, args) for item in self.tokens for ep, args in endpoints])
+        self._learn_ids(results)
+        for item_id in self.tokens:
             short = short_hash(item_id)
             try:
-                raw_accounts = self.api.accounts_get(token).get("accounts", [])
-                self._pids.update(a["account_id"] for a in raw_accounts)
+                failed = next((r for ep, _ in endpoints if isinstance(r := results[item_id, ep], Exception)), None)
+                if failed is not None:
+                    raise failed
                 item_notes: list[str] = []
+                raw_accounts = results[item_id, "accounts_get"].get("accounts", [])
                 item_accounts = [_plaid_account(a, short, self.clean, item_notes) for a in raw_accounts]
                 by_pid = {a["_pid"]: a for a in item_accounts}
                 item_held = (
-                    _plaid_holdings(self.api.investments_holdings_get(token), by_pid, self.clean, item_notes)
+                    _plaid_holdings(results[item_id, "investments_holdings_get"], by_pid, self.clean, item_notes)
                     if holdings
                     else []
                 )
                 item_txs = (
-                    _plaid_transactions(
-                        self.api.investments_transactions_get(token, *tx_range), by_pid, self.clean, item_notes
-                    )
+                    _plaid_transactions(results[item_id, "investments_transactions_get"], by_pid, self.clean, item_notes)
                     if tx_range
                     else []
                 )
@@ -156,7 +273,7 @@ class Backend:
     def _csv_accounts(self) -> dict[str, dict]:
         rows = self.conn.execute("SELECT account_id, name, type, mask FROM accounts WHERE source = 'csv'").fetchall()
         return {
-            r[0]: {"id": short_hash(r[0]), "name": r[1], "type": r[2].lower(), "subtype": None, "mask": r[3], "source": "csv"}
+            r[0]: {"id": short_hash(r[0]), "name": clean_text(r[1]), "type": r[2].lower(), "subtype": None, "mask": r[3], "source": "csv"}
             for r in rows
         }
 
@@ -232,7 +349,7 @@ class Backend:
                 continue
             rows.append({
                 "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"],
-                "account_type": acct["type"], "symbol": h["symbol"], "name": clean_text(h["name"]),
+                "account_type": acct["type"], "symbol": clean_text(h["symbol"])[:MAX_SYMBOL], "name": clean_text(h["name"]),
                 "quantity": h["quantity"], "price": h["price"] or None, "market_value": h["market_value"] or None,
                 "cost_basis": h["book_value"] or None, "currency": _currency(h["currency"], notes),
                 "security_type": None,
@@ -244,7 +361,9 @@ class Backend:
     def _merged_transactions(self, notes: list[str], days: int, investments_only: bool):
         end = self.today()
         start = end - timedelta(days=days)
-        plaid_accts, _, plaid_txs = self._load_plaid(notes, tx_range=(start, end))
+        # one fixed window per item (cached once per TTL); any `days` is then a local filter
+        plaid_accts, _, plaid_txs = self._load_plaid(notes, tx_range=(end - timedelta(days=MAX_DAYS), end))
+        plaid_txs = [t for t in plaid_txs if t["date"] and start.isoformat() <= t["date"] <= end.isoformat()]
         csv_accts = self._csv_accounts()
         match = self._resolve(csv_accts, plaid_accts, notes)
         covered = {(t["account_id"], t["date"]) for t in plaid_txs}
@@ -264,7 +383,7 @@ class Backend:
             rows.append({
                 "date": day, "description": clean_text(description), "amount": amount,
                 "currency": _currency(currency, notes),
-                "type": type_, "symbol": symbol or None, "account_id": acct["id"], "account": acct["name"],
+                "type": type_, "symbol": clean_text(symbol or "")[:MAX_SYMBOL] or None, "account_id": acct["id"], "account": acct["name"],
                 "account_mask": acct["mask"], "source": source,
             })
         if investments_only:
@@ -277,8 +396,8 @@ def _plaid_account(a: dict, item_short: str, clean: Callable[[str], str], notes:
     b = a.get("balances") or {}
     return {
         "id": short_hash(a["account_id"]), "_pid": a["account_id"], "name": clean(a.get("name") or a.get("official_name") or ""),
-        "_official": clean(a.get("official_name") or ""), "type": _enum(a.get("type")).lower(),
-        "subtype": _enum(a.get("subtype")).lower() or None, "mask": (a.get("mask") or "")[-4:],
+        "_official": clean(a.get("official_name") or ""), "type": clean(_enum(a.get("type"))).lower()[:MAX_KIND],
+        "subtype": clean(_enum(a.get("subtype"))).lower()[:MAX_KIND] or None, "mask": (a.get("mask") or "")[-4:],
         "currency": _currency(b.get("iso_currency_code") or b.get("unofficial_currency_code"), notes),
         "current": _str(_dec(b.get("current"))), "available": _str(_dec(b.get("available"))),
         "limit": _str(_dec(b.get("limit"))), "basis": "reported_balance", "as_of": None, "source": "plaid", "item": item_short,
@@ -295,12 +414,12 @@ def _plaid_holdings(resp: dict, by_pid: dict[str, dict], clean: Callable[[str], 
         sec = securities.get(h.get("security_id")) or {}
         rows.append({
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "account_type": acct["type"],
-            "symbol": clean(sec.get("ticker_symbol") or "").upper(), "name": clean(sec.get("name") or ""),
+            "symbol": _symbol(sec, clean) or "", "name": clean(sec.get("name") or ""),
             "quantity": _str(_dec(h.get("quantity"))), "price": _str(_dec(h.get("institution_price"))),
             "market_value": _str(_dec(h.get("institution_value"))), "cost_basis": _str(_dec(h.get("cost_basis"))),
             "currency": _currency(h.get("iso_currency_code") or sec.get("iso_currency_code"), notes) or acct["currency"],
-            "security_type": _enum(sec.get("type")).lower() or None,
-            "as_of": str(h.get("institution_price_as_of") or "")[:10] or None, "as_of_inferred": False,
+            "security_type": _security_type(sec.get("type")),
+            "as_of": _date(h.get("institution_price_as_of")), "as_of_inferred": False,
             "source": "plaid",
         })
     return rows
@@ -320,14 +439,37 @@ def _plaid_transactions(
         kind = _activity_type(f"{subtype} {plaid_type}")
         amount = _dec(t.get("amount"))
         rows.append({
-            "date": str(t["date"])[:10], "description": clean(t.get("name") or ""),
+            "date": _date(t.get("date")), "description": clean(t.get("name") or ""),
             "amount": _str(-amount if amount is not None else None),
             "currency": _currency(t.get("iso_currency_code"), notes) or acct["currency"],
-            "type": plaid_type if kind == "other" else kind,
-            "symbol": clean(sec.get("ticker_symbol") or "").upper() or None,
+            "type": (plaid_type if plaid_type in PLAID_TX_TYPES else "other") if kind == "other" else kind,
+            "symbol": _symbol(sec, clean),
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "source": "plaid",
         })
     return rows
+
+
+def _minimise(endpoint: str, resp: Any) -> Any:
+    keep = KEEP.get(endpoint)
+    if keep is None or not isinstance(resp, dict):
+        return resp
+    return {key: [{f: row[f] for f in fields if f in row} for row in resp.get(key) or []] for key, fields in keep.items()}
+
+
+def _symbol(sec: dict, clean: Callable[[str], str]) -> str | None:
+    return clean(sec.get("ticker_symbol") or "").upper()[:MAX_SYMBOL] or None
+
+
+def _security_type(raw: Any) -> str | None:
+    value = _enum(raw).strip().lower()
+    if not value:
+        return None
+    return value if value in SECURITY_TYPES else "other"
+
+
+def _date(raw: Any) -> str | None:
+    value = str(raw or "")[:10]
+    return value if DATE_RE.fullmatch(value) else None
 
 
 def _family(norm: str) -> str | None:
@@ -384,170 +526,226 @@ def _match_accounts(csv_accts: dict, plaid_accts: list[dict]) -> tuple[dict[str,
     return match, conflicts, conflicted
 
 
+
+
 def _bucket(account_type: str) -> str:
     return account_type or "unknown"
 
 
+# ---- output formatting ---------------------------------------------------------------------------------------
+
+CENT = Decimal("0.01")
+QTY_STEP = Decimal("0.000001")
+
+
+def _money(value: Any) -> str | None:
+    d = value if isinstance(value, Decimal) else _dec(value)
+    return None if d is None else format(d.quantize(CENT, ROUND_HALF_UP) + 0, "f")  # + 0 turns -0.00 into 0.00
+
+
+def _qty(value: Any) -> str | None:
+    d = _dec(value)
+    if d is None:
+        return None
+    s = format(d.quantize(QTY_STEP, ROUND_HALF_UP) + 0, "f")
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def _pct(part: Decimal, total: Decimal) -> str:
+    return format((part / total * 100).quantize(Decimal("0.1"), ROUND_HALF_UP), "f") if total else "0.0"
+
+
+def _compact(value: Any) -> Any:
+    """Drop None, empty strings, lists and dicts at every level."""
+    if isinstance(value, dict):
+        out = {k: _compact(v) for k, v in value.items()}
+        return {k: v for k, v in out.items() if v is not None and v != "" and v != [] and v != {}}
+    if isinstance(value, list):
+        return [_compact(v) for v in value]
+    return value
+
+
 def _result(notes: list[str], **data: Any) -> dict:
+    out = _compact(data)
     # several merge passes in one tool can raise the same note; keep the first of each, in order
-    return {**data, "notes": list(dict.fromkeys(notes))}
+    if notes:
+        out["notes"] = list(dict.fromkeys(notes))
+    return out
 
 
 def _start(backend: Backend) -> list[str]:
     return list(backend.setup_notes)
 
 
+def _full(detail: str) -> bool:
+    return str(detail).strip().lower() == "full"
+
+
+def _text(text: str | None, full: bool) -> str | None:
+    """Display length for free text that has already been sanitised."""
+    return cut(text, FULL_TEXT if full else CONCISE_TEXT)
+
+
+def _account_filter(account: str | None):
+    key = (account or "").strip().casefold()
+    if not key:
+        return None
+    return lambda acct_id, mask, name: key in (acct_id, (mask or "").casefold(), (name or "").casefold())
+
+
 # ---- tools ---------------------------------------------------------------------------------------------------
 
 
-def list_accounts(backend: Backend) -> dict:
+def accounts(backend: Backend, detail: str = "concise") -> dict:
+    full = _full(detail)
     notes = _start(backend)
     rows, *_ = backend._merged_accounts(notes)
-    accounts = [
-        {
-            **{k: r[k] for k in ("id", "name", "type", "subtype", "mask", "currency", "source")},
-            "balances": {k: r[k] for k in ("current", "available", "limit", "basis", "as_of")},
-        }
-        for r in rows
-    ]
-    return _result(notes, accounts=accounts)
+    out = []
+    for r in rows:
+        row = {"id": r["id"], "name": _text(r["name"], full),
+               "type": r["type"] if full else (r["subtype"] or r["type"]), "last4": r["mask"],
+               "currency": r["currency"], "balance": _money(r["current"])}
+        if full:
+            row |= {"subtype": r["subtype"], "available": _money(r["available"]), "limit": _money(r["limit"]),
+                    "basis": r["basis"], "as_of": r["as_of"], "source": r["source"]}
+        out.append(row)
+    return _result(notes, accounts=out)
 
 
-def get_balances(backend: Backend) -> dict:
+def holdings(backend: Backend, account: str | None = None, detail: str = "concise",
+             limit: int = DEFAULT_HOLDINGS) -> dict:
+    full = _full(detail)
     notes = _start(backend)
-    rows, *_ = backend._merged_accounts(notes)
-    balances = [
-        {k: r[k] for k in ("id", "name", "type", "subtype", "mask", "currency", "current", "available", "basis", "as_of", "source")}
-        for r in rows
-    ]
-    return _result(notes, balances=balances)
-
-
-def get_holdings(backend: Backend, account: str | None = None) -> dict:
-    notes = _start(backend)
+    limit = _clamp(limit, MAX_HOLDINGS, low=0)
     rows = backend._merged_holdings(notes)
-    if account:
-        key = account.strip().casefold()
-        rows = [r for r in rows if key in (r["account_id"], r["account_mask"], r["account"].casefold())]
-    truncated = len(rows) > MAX_HOLDINGS
-    if truncated:
-        notes.append(f"Showing the first {MAX_HOLDINGS} of {len(rows)} holdings; filter by account to see the rest.")
-    return _result(notes, holdings=[_public(r) for r in rows[:MAX_HOLDINGS]], total_count=len(rows), truncated=truncated)
+    keep = _account_filter(account)
+    if keep:
+        rows = [r for r in rows if keep(r["account_id"], r["account_mask"], r["account"])]
+        if not rows:
+            notes.append("No holdings match that account. Use an id, last4 or name from the accounts tool.")
+    rows.sort(key=lambda r: _dec(r["market_value"]) or Decimal("-Infinity"), reverse=True)
+    totals: dict[str, Decimal] = defaultdict(Decimal)
+    for r in rows:
+        if (value := _dec(r["market_value"])) is not None and r["currency"]:
+            totals[r["currency"]] += value
+    out = []
+    for r in rows[:limit]:
+        row = {"symbol": r["symbol"], "name": _text(r["name"], full) if full or not r["symbol"] else None,
+               "qty": _qty(r["quantity"]), "value": _money(r["market_value"]), "currency": r["currency"],
+               "last4": r["account_mask"]}
+        if full:
+            row |= {"price": _money(r["price"]), "cost_basis": _money(r["cost_basis"]),
+                    "security_type": r["security_type"], "account": _text(r["account"], full), "as_of": r["as_of"],
+                    "source": r["source"]}
+        out.append(row)
+    summary = {"count": len(rows), "value": {c: _money(v) for c, v in sorted(totals.items())}}
+    if len(rows) > limit:
+        summary["omitted"] = len(rows) - limit
+    return _result(notes, holdings=out, summary=summary)
 
 
-def _transactions_result(backend: Backend, days: int, limit: int, investments_only: bool) -> dict:
+def transactions(backend: Backend, days: int = 90, account: str | None = None, symbol: str | None = None,
+                 kind: str | None = None, limit: int = 25, detail: str = "concise") -> dict:
+    full = _full(detail)
     notes = _start(backend)
-    days, limit = _clamp(days, MAX_DAYS), _clamp(limit, MAX_LIMIT)
-    rows = backend._merged_transactions(notes, days, investments_only)
-    out = {"days": days, "transactions": [_public(r) for r in rows[:limit]], "total_count": len(rows),
-           "truncated": len(rows) > limit}
-    if out["truncated"]:
-        by_type: dict[str, dict] = {}
-        for r in rows:
-            entry = by_type.setdefault(r["type"], {"count": 0, "_totals": defaultdict(Decimal)})
-            entry["count"] += 1
-            amount = _dec(r["amount"])
-            if amount is not None:
-                entry["_totals"][r["currency"]] += amount
-        out["summary"] = {
-            "note": f"All {len(rows)} matching rows summarised; only the most recent {limit} are listed.",
-            "by_type": {
-                t: {"count": e["count"], "total_by_currency": {c: _str(v) for c, v in sorted(e["_totals"].items())}}
-                for t, e in sorted(by_type.items())
-            },
-        }
-    return _result(notes, **out)
+    days, limit = _clamp(days, MAX_DAYS), _clamp(limit, MAX_LIMIT, low=0)
+    kind = (kind or "").strip().lower()
+    rows = backend._merged_transactions(notes, days, investments_only=kind == "investment")
+    present = sorted({r["type"] for r in rows if r["type"]})
+    keep = _account_filter(account)
+    if keep:
+        rows = [r for r in rows if keep(r["account_id"], r["account_mask"], r["account"])]
+    if symbol and symbol.strip():
+        rows = [r for r in rows if (r["symbol"] or "").casefold() == symbol.strip().casefold()]
+    if kind and kind != "investment":
+        rows = [r for r in rows if r["type"] == kind]
+        if kind not in present:
+            notes.append(f"No '{cut(clean_text(kind), 20)}' transactions in this window. Kinds present: "
+                         + (", ".join(present) or "none") + "; or use 'investment'.")
+    flows: dict[str, dict[str, Decimal]] = defaultdict(lambda: {"in": Decimal(), "out": Decimal()})
+    for r in rows:
+        if (amount := _dec(r["amount"])) is not None:
+            flows[r["currency"] or "???"]["in" if amount > 0 else "out"] += amount
+    out = []
+    for r in rows[:limit]:
+        row = {"date": r["date"], "type": r["type"], "symbol": r["symbol"], "amount": _money(r["amount"]),
+               "currency": r["currency"], "last4": r["account_mask"]}
+        # the description mostly repeats type and symbol; concise keeps it only when there is no symbol
+        if full or not r["symbol"]:
+            row["desc"] = _text(r["description"], full)
+        if full:
+            row |= {"account": _text(r["account"], full), "source": r["source"]}
+        out.append(row)
+    summary = {"days": days, "count": len(rows),
+               "totals": {c: {k: _money(v) for k, v in f.items() if v} for c, f in sorted(flows.items())}}
+    if len(rows) > limit:
+        summary["omitted"] = len(rows) - limit
+    return _result(notes, transactions=out, summary=summary)
 
 
-def get_transactions(backend: Backend, days: int = 90, limit: int = 100) -> dict:
-    return _transactions_result(backend, days, limit, investments_only=False)
-
-
-def get_investment_transactions(backend: Backend, days: int = 90, limit: int = 100) -> dict:
-    return _transactions_result(backend, days, limit, investments_only=True)
-
-
-def _pct(part: Decimal, total: Decimal) -> str:
-    return format((part / total * 100).quantize(Decimal("0.01")), "f") if total else "0.00"
-
-
-def net_worth(backend: Backend, currency: str = "CAD") -> dict:
+def summary(backend: Backend, currency: str = "CAD") -> dict:
     notes = _start(backend)
-    rows, *_ = backend._merged_accounts(notes)
-    by_cur: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    rows, _, csv_accts, match, plaid_held = backend._merged_accounts(notes, holdings=True)
+    held = backend._holdings_from(csv_accts, match, plaid_held, notes)
+    net: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    assets: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    secs: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
     for r in rows:
         value = _dec(r["current"])
         if value is None or not r["currency"]:
             continue
+        bucket = _bucket(r["subtype"] or r["type"])
         if r["type"] in LIABILITY_TYPES:
-            value = -value
-        by_cur[r["currency"]][_bucket(r["subtype"] or r["type"])] += value
-    currencies = {
-        cur: {"total": _str(sum(types.values(), Decimal())), "by_account_type": {t: _str(v) for t, v in sorted(types.items())}}
-        for cur, types in sorted(by_cur.items())
+            net[r["currency"]][bucket] -= value
+            continue
+        net[r["currency"]][bucket] += value
+        if value > 0:
+            assets[r["currency"]][bucket] += value
+    for h in held:
+        value = _dec(h["market_value"])
+        if value is not None and h["currency"] and value > 0:
+            secs[h["currency"]][h["security_type"] or "unclassified"] += value
+
+    def table(values: dict[str, Decimal], shares: dict[str, Decimal]) -> dict:
+        # percentages are shares of positive asset balances; liabilities carry a value but no share
+        total = sum(shares.values(), Decimal())
+        ordered = sorted(values.items(), key=lambda kv: -kv[1])
+        return {k: {"value": _money(v), "pct": _pct(shares[k], total) if k in shares else None} for k, v in ordered}
+
+    by_currency = {
+        cur: {"net_worth": _money(sum(net.get(cur, {}).values(), Decimal())),
+              "by_account_type": table(net.get(cur, {}), assets.get(cur, {})),
+              "by_security_type": table(secs.get(cur, {}), secs.get(cur, {}))}
+        for cur in sorted(set(net) | set(secs))
     }
     primary = currency.strip().upper()
     if not CURRENCY_RE.fullmatch(primary):
         notes.append("Invalid currency code; using CAD.")
         primary = "CAD"
-    mixed = len(currencies) > 1
-    if mixed:
-        notes.append("Several currencies are present. They are reported separately and not converted.")
-    return _result(
-        notes, primary_currency=primary, primary_total=currencies.get(primary, {}).get("total", "0"),
-        by_currency=currencies, mixed_currencies=mixed,
-    )
+    if len(by_currency) > 1:
+        notes.append("Several currencies: each is totalled separately, percentages are within each currency, "
+                     "nothing is converted.")
+    return _result(notes, currency=primary, net_worth=by_currency.get(primary, {}).get("net_worth", "0.00"),
+                   by_currency=by_currency)
 
 
-def allocation(backend: Backend) -> dict:
-    notes = _start(backend)
-    rows, _, csv_accts, match, plaid_held = backend._merged_accounts(notes, holdings=True)
-    holdings = backend._holdings_from(csv_accts, match, plaid_held, notes)
-    acct_vals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
-    sec_vals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
-    for r in rows:
-        value = _dec(r["current"])
-        if value is not None and r["currency"] and r["type"] not in LIABILITY_TYPES and value > 0:
-            acct_vals[r["currency"]][_bucket(r["subtype"] or r["type"])] += value
-    for h in holdings:
-        value = _dec(h["market_value"])
-        if value is not None and h["currency"] and value > 0:
-            sec_vals[h["currency"]][h["security_type"] or "unclassified"] += value
-
-    def table(vals: dict[str, Decimal]) -> list[dict]:
-        total = sum(vals.values(), Decimal())
-        return [{"type": k, "value": _str(v), "percent": _pct(v, total)} for k, v in sorted(vals.items(), key=lambda kv: -kv[1])]
-
-    out = {
-        cur: {"by_account_type": table(acct_vals.get(cur, {})), "by_security_type": table(sec_vals.get(cur, {}))}
-        for cur in sorted(set(acct_vals) | set(sec_vals))
-    }
-    if len(out) > 1:
-        notes.append("Several currencies are present. Percentages are computed within each currency; nothing is converted.")
-    return _result(notes, by_currency=out)
-
-
-def item_health(backend: Backend) -> dict:
+def health(backend: Backend) -> dict:
     notes = _start(backend)
     items = []
-    for item_id, token in backend.tokens.items():
+    if not backend.api:
+        return _result(notes, items=items)
+    # account ids are learned first so the scrubber can remove them from item text below
+    results = backend._fetch_all([(item, ep, ()) for item in backend.tokens for ep in ("accounts_get", "item_get")])
+    backend._learn_ids(results)
+    for item_id in backend.tokens:
         short = short_hash(item_id)
-        if not backend.api:
-            break
-        try:
-            # learn this item's account ids first so the scrubber can remove them from free text below; every tool
-            # call has a fresh Backend, so nothing else may have loaded them yet
-            backend._pids.update(a["account_id"] for a in backend.api.accounts_get(token).get("accounts", []))
-        except Exception:
-            pass  # item_get below reports the problem
-        try:
-            resp = backend.api.item_get(token)
-            item = resp.get("item") or {}
-        except Exception as exc:
-            notes.append(_error_note(short, exc, backend.clean))
-            items.append({"id": short, "institution": None, "products": [], "last_successful_update": None,
-                          "error_code": backend.clean(exc.code) if isinstance(exc, PlaidError) else type(exc).__name__})
+        resp = results[item_id, "item_get"]
+        if isinstance(resp, Exception):
+            notes.append(_error_note(short, resp, backend.clean))
+            items.append({"id": short,
+                          "error": backend.clean(resp.code) if isinstance(resp, PlaidError) else type(resp).__name__})
             continue
+        item = resp.get("item") or {}
         status = resp.get("status") or {}  # top level of /item/get, beside "item"
         stamps = (_iso((status.get(k) or {}).get("last_successful_update")) for k in ("investments", "transactions"))
         updates = [t for t in stamps if TIMESTAMP_RE.fullmatch(t)]
@@ -556,8 +754,8 @@ def item_health(backend: Backend) -> dict:
         if code == "ITEM_LOGIN_REQUIRED":
             notes.append(f"Plaid item {short} needs re-authentication. " + _reauth_hint(short))
         items.append({
-            "id": short, "institution": backend.clean(item.get("institution_name") or "") or None,
+            "id": short, "institution": _text(backend.clean(item.get("institution_name") or ""), False),
             "products": sorted(backend.clean(_enum(p)) for p in item.get("products") or []),
-            "last_successful_update": max(updates) if updates else None, "error_code": code,
+            "last_update": max(updates) if updates else None, "error": code,
         })
     return _result(notes, items=items)
