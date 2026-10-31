@@ -121,8 +121,9 @@ def test_accounts_concise_shape_and_merge(backend):
     assert [n for n in out["notes"] if "Possible double count" in n and "Non-registered" in n]
     assert not [n for n in out["notes"] if "TFSA" in n and "double" in n]
     by_name = {a["name"]: a for a in out["accounts"]}
-    assert by_name["TFSA"] == {"id": short_hash(PID_TFSA), "name": "TFSA", "type": "tfsa", "last4": "1111",
-                               "currency": "CAD", "balance": "1000.50"}
+    assert by_name["TFSA"] == {"id": short_hash(PID_TFSA), "name": "TFSA", "account_kind": "tfsa",
+                               "kind_basis": "subtype", "tax": "tax-free", "last4": "1111", "currency": "CAD",
+                               "balance": "1000.50", "cash_estimate": "969.00"}
     # CSV accounts that match a Plaid account (type + mask) are not listed twice
     assert [a["name"] for a in out["accounts"] if a["last4"] == "1111"] == ["TFSA"]
     assert by_name["Fake Crypto"]["balance"] == "500.00"
@@ -496,6 +497,32 @@ def test_open_backend_passes_keys_for_redaction(monkeypatch, tmp_path):
         assert b.secrets == ("cid-marker-1", "sec-marker-2") and b.cache is server.CACHE
     finally:
         b.close()
+
+
+def test_open_backend_wires_the_fx_source_unless_disabled(monkeypatch, tmp_path):
+    from app import fx
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    b = server.open_backend()
+    try:
+        assert b.fx == server.FX.rate and b.fx() is not None  # the conftest fake, never the Bank of Canada
+    finally:
+        b.close()
+    monkeypatch.setattr(server, "FX", fx.FxSource(fetcher=lambda: pytest.fail("fetched while disabled"), enabled=False))
+    b = server.open_backend()
+    try:
+        assert b.fx is None
+    finally:
+        b.close()
+
+
+def test_fx_enabled_setting_defaults_on_and_reads_the_environment(monkeypatch):
+    from app.config import Settings
+
+    assert Settings(_env_file=None).fx_enabled is True
+    monkeypatch.setenv("FX_ENABLED", "false")
+    assert Settings(_env_file=None).fx_enabled is False
 
 
 def test_tools_registered_read_only_and_open_world():

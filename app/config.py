@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     plaid_env: Literal["sandbox", "production"] = "sandbox"
     data_dir: Path = ROOT / "data"
     country_codes: list[str] = ["CA"]
+    # one public GET to the Bank of Canada for the USD/CAD rate behind cash estimates (app/fx.py); false turns it off
+    fx_enabled: bool = True
 
     # where secrets live: the OS keychain (default) or systemd credentials on a headless server (see app/secrets.py)
     secrets_backend: Literal["keyring", "systemd"] = "keyring"

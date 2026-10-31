@@ -3,7 +3,7 @@
 Rules every tool follows:
   * Rows carry `source` ("plaid" | "csv"); Plaid wins when both cover the same account (and date, for transactions).
   * Only needed fields are returned. Account ids are short local hashes, never Plaid ids, tokens or full numbers.
-  * Money values are Decimal strings; currencies are never converted.
+  * Money values are Decimal strings; currencies are never converted, except inside cash_estimate (see _derive).
   * A Plaid holding or investment transaction whose security trades on a US exchange in USD is shown in USD even when
     the institution labels it otherwise (Wealthsimple labels every holding CAD); see holding_currency.
   * Plaid failures become short notes (code + display message); other sources still answer.
@@ -11,6 +11,15 @@ Rules every tool follows:
     (after it has been sanitised) to CONCISE_TEXT or FULL_TEXT characters.
 Amount sign convention for transactions: negative = cash out of the account, positive = cash in. Plaid reports the
 opposite for investment transactions, so its sign is flipped to match the CSV exports.
+
+What the raw Plaid data means, and how it is presented (see account_kind and _derive):
+  * balances.current is the institution's total in the account's currency; for investment accounts it includes
+    cash. balances.available is always null and holdings never include a cash position, so Plaid gives no cash
+    figure: cash_estimate = balance - holdings, with USD holdings converted at the Bank of Canada rate (app/fx.py).
+  * Plaid's subtype is often generic ("brokerage" covers FHSA and non-registered accounts), so account_kind comes from
+    the subtype, then from keywords in the name, then "cash" for an investment account with no holdings; kind_basis
+    says which. A generic subtype with an uninformative name stays "other": the kind is never guessed.
+  * Accounts with a zero balance and no holdings are noise; concise output counts them as hidden_empty.
 
 Plaid responses are cached per process (PlaidCache) as raw responses keyed by item, token digest, endpoint and
 arguments; every call still runs the full clean-and-merge pipeline on them, so caching changes no output.
@@ -65,6 +74,48 @@ KEEP = {
     },
 }
 LIABILITY_TYPES = {"credit", "loan"}
+LIABILITY_KINDS = {"credit_card", "line_of_credit"}
+INVESTMENT_ACCOUNT_TYPES = {"investment", "brokerage"}  # Plaid's account type; "brokerage" is its legacy name
+# normalised subtype (or CSV account type) -> account_kind. "brokerage" is absent on purpose: it says nothing.
+SUBTYPE_KINDS = {
+    "tfsa": "tfsa", "fhsa": "fhsa", "rrsp": "rrsp", "resp": "resp", "rrif": "rrif", "rdsp": "rdsp",
+    # locked-in plans (Plaid's Canadian subtypes) share the lira family
+    "lira": "lira", "lrsp": "lira", "lif": "lira", "lrif": "lira", "prif": "lira", "rlif": "lira",
+    "nonregistered": "non_registered", "margin": "non_registered", "individual": "non_registered",
+    "cash": "cash", "savings": "cash", "checking": "chequing", "chequing": "chequing",
+    "creditcard": "credit_card", "lineofcredit": "line_of_credit",
+}
+# whole-word keywords in an account name (or in a longer subtype such as MANAGED_TFSA) -> account_kind
+NAME_KINDS = (
+    ("fhsa", re.compile(r"\bfhsa\b")), ("tfsa", re.compile(r"\btfsa\b")), ("rrsp", re.compile(r"\brrsp\b")),
+    ("resp", re.compile(r"\bresp\b")), ("rrif", re.compile(r"\brrif\b")), ("rdsp", re.compile(r"\brdsp\b")),
+    ("lira", re.compile(r"\b(?:lira|lrsp|lif|lrif|prif|rlif)\b")),
+    ("non_registered", re.compile(r"\bnon[\s-]?reg(?:istered)?\b|\bmargin\b|\bindividual\b")),
+)
+TAX = {"tfsa": "tax-free", "fhsa": "tax-free", "rrsp": "tax-deferred", "resp": "tax-deferred",
+       "rrif": "tax-deferred", "rdsp": "tax-deferred", "lira": "tax-deferred", "non_registered": "taxable"}
+GENERIC_SUBTYPES = {"", "brokerage", "investment", "other"}  # say nothing about the kind: "other" gets a note
+# generic brokerage subtypes whose account, with no holdings, is all cash. Not crypto or unknown subtypes: their
+# assets may simply not be reported as holdings.
+CASH_IF_EMPTY = {"brokerage", "cashmanagement", "nontaxablebrokerageaccount"}
+CLAMP = Decimal("0.01")  # a shortfall within 1% of the balance, and at most CLAMP_MAX, is price timing or FX: 0
+CLAMP_MAX = Decimal("50")
+CASH_NOTE = ("Plaid doesn't report cash for these accounts; estimated as balance minus holdings at the Bank of Canada "
+             "rate. Small differences come from the broker's own FX rate and price timing.")
+FX_FAILED_NOTE = ("The Bank of Canada USD/CAD rate couldn't be fetched, so cash_estimate is omitted for accounts "
+                  "holding USD.")
+FX_OFF_NOTE = "FX lookup is off (FX_ENABLED=false), so cash_estimate is omitted for accounts holding USD."
+OTHER_CCY_NOTE = "cash_estimate is omitted for accounts with holdings in a currency other than CAD or USD."
+NEGATIVE_NOTE = ("cash_estimate is omitted where holdings exceed the balance by more than 1%, which means stale or "
+                 "incomplete holdings.")
+NO_VALUE_NOTE = "cash_estimate is omitted for accounts with a holding that has no market value."
+GENERIC_NOTE = ("account_kind 'other': the institution reports only a generic type (such as brokerage) and the name "
+                "doesn't say which kind.")
+AMBIGUOUS_NOTE = "account_kind 'other': the account name mentions more than one account type."
+HIDDEN_NOTE = "hidden_empty counts accounts with a zero balance and no holdings; detail='full' lists them."
+SUMMARY_NOTE = ("by_kind is from balances. cash_total_estimate = chequing and cash-account balances plus the cash "
+                "estimated in investment accounts; invested_total = investment balances minus that cash. CSV-only "
+                "balances are holdings values, so they count as invested, not cash.")
 # ISO 10383 codes of US exchanges. A security listed on one of these in USD is priced in USD, whatever the holding's
 # label says. OTC (OOTC) is left out on purpose: Plaid matches TSX-listed ETFs to US OTC tickers, and those holdings
 # really are in the institution's currency.
@@ -198,6 +249,7 @@ class Backend:
     today: Callable[[], date] = date.today
     cache: PlaidCache | None = None  # shared across calls by the server; None fetches every time
     secrets: tuple[str, ...] = ()  # Plaid client id and secret, redacted from free text as defence in depth
+    fx: Callable[[], Any] | None = None  # returns an app.fx.Rate or None (no rate); None here means FX lookup is off
     _pids: set[str] = field(default_factory=set)  # Plaid account ids seen so far; scrubbed from free text
 
     def clean(self, raw: Any) -> str:
@@ -252,7 +304,9 @@ class Backend:
             if endpoint == "accounts_get" and isinstance(r, dict):
                 self._pids.update(a["account_id"] for a in r.get("accounts", []) if a.get("account_id"))
 
-    def _load_plaid(self, notes: list[str], holdings: bool = False, tx_range: tuple[date, date] | None = None):
+    def _load_plaid(self, notes: list[str], holdings: bool | str = False, tx_range: tuple[date, date] | None = None):
+        """holdings: False, True (an item whose holdings fail is dropped) or "optional" (its accounts are kept, with
+        a note). Each account gets _held=True when its item's holdings loaded, so "no holdings" is known, not assumed."""
         accounts: list[dict] = []
         held: list[dict] = []
         txs: list[dict] = []
@@ -265,21 +319,26 @@ class Backend:
             endpoints.append(("investments_transactions_get", tuple(tx_range)))
         results = self._fetch_all([(item, ep, args) for item in self.tokens for ep, args in endpoints])
         self._learn_ids(results)
+        optional = {"investments_holdings_get"} if holdings == "optional" else set()
         for item_id in self.tokens:
             short = short_hash(item_id)
             try:
-                failed = next((r for ep, _ in endpoints if isinstance(r := results[item_id, ep], Exception)), None)
+                failed = next((r for ep, _ in endpoints
+                               if ep not in optional and isinstance(r := results[item_id, ep], Exception)), None)
                 if failed is not None:
                     raise failed
                 item_notes: list[str] = []
                 raw_accounts = results[item_id, "accounts_get"].get("accounts", [])
                 item_accounts = [_plaid_account(a, short, self.clean, item_notes) for a in raw_accounts]
                 by_pid = {a["_pid"]: a for a in item_accounts}
-                item_held = (
-                    _plaid_holdings(results[item_id, "investments_holdings_get"], by_pid, self.clean, item_notes)
-                    if holdings
-                    else []
-                )
+                held_resp = results[item_id, "investments_holdings_get"] if holdings else None
+                if isinstance(held_resp, Exception):  # optional: keep the accounts and say what is missing
+                    item_notes.append(_error_note(short, held_resp, self.clean)
+                                      + " Without holdings, account kinds and cash estimates are partial.")
+                    held_resp = None
+                item_held = _plaid_holdings(held_resp, by_pid, self.clean, item_notes) if held_resp is not None else []
+                for a in item_accounts:
+                    a["_held"] = held_resp is not None
                 item_txs = (
                     _plaid_transactions(results[item_id, "investments_transactions_get"], by_pid, self.clean, item_notes)
                     if tx_range
@@ -332,7 +391,7 @@ class Backend:
                     )
         return match
 
-    def _merged_accounts(self, notes: list[str], holdings: bool = False):
+    def _merged_accounts(self, notes: list[str], holdings: bool | str = False):
         """Plaid accounts plus CSV accounts that no Plaid account covers. Returns (rows, plaid_accts, csv_accts, match, held)."""
         plaid_accts, plaid_held, _ = self._load_plaid(notes, holdings=holdings)
         csv_accts = self._csv_accounts()
@@ -563,6 +622,121 @@ def _bucket(account_type: str) -> str:
     return account_type or "unknown"
 
 
+# ---- derived fields: account_kind and cash_estimate -----------------------------------------------------------
+
+
+def _keyword_kinds(text: str | None) -> set[str]:
+    words = (text or "").lower().replace("_", " ")
+    kinds = {kind for kind, pattern in NAME_KINDS if pattern.search(words)}
+    if len(kinds) > 1:  # a registered plan beats "individual" or "margin": "Individual TFSA" is a TFSA
+        kinds.discard("non_registered")
+    return kinds
+
+
+def account_kind(subtype: str | None, name: str | None, no_holdings: bool = False) -> tuple[str, str, str | None]:
+    """(account_kind, kind_basis, note) from the reported subtype, then name keywords, then "no holdings".
+
+    no_holdings is True only for an investment account whose holdings were loaded and are empty. A generic subtype
+    (such as brokerage) with an uninformative name is "other" with a note, never a guess. Only a generic brokerage
+    subtype with no holdings is "cash"; kind_basis is "none" when no subtype was reported.
+    """
+    sub = _norm(subtype or "")
+    if sub in SUBTYPE_KINDS:
+        return SUBTYPE_KINDS[sub], "subtype", None
+    from_subtype = _keyword_kinds(subtype)
+    if len(from_subtype) == 1:
+        return from_subtype.pop(), "subtype", None
+    from_name = _keyword_kinds(name)
+    if len(from_name) == 1:
+        return from_name.pop(), "name", None
+    if len(from_name) > 1:
+        return "other", "name", AMBIGUOUS_NOTE
+    if no_holdings and sub in CASH_IF_EMPTY:
+        return "cash", "no holdings", None
+    return "other", "subtype" if sub else "none", GENERIC_NOTE if sub in GENERIC_SUBTYPES else None
+
+
+class _FxOnce:
+    """Asks for the FX rate at most once per response, and only when an estimate needs it."""
+
+    def __init__(self, source: Callable[[], Any] | None):
+        self.source, self.asked, self.rate, self.used = source, False, None, None
+
+    def get(self):
+        if not self.asked:
+            self.asked = True
+            try:
+                self.rate = self.source() if self.source else None
+            except Exception:  # FxSource never raises; any other source failing is treated as no rate
+                self.rate = None
+        if self.rate is not None:
+            self.used = self.rate
+        return self.rate
+
+    def why(self) -> str:
+        return FX_OFF_NOTE if self.source is None else FX_FAILED_NOTE
+
+
+def _cash_estimate(balance: Decimal, currency: str, positions: list[dict], fx: _FxOnce,
+                   notes: list[str]) -> Decimal | None:
+    """balance - holdings value in the account's currency; None, with a note, when it can't be estimated honestly."""
+    total = Decimal()
+    for p in positions:
+        value, cur = _dec(p["market_value"]), p["currency"]
+        if value is None:
+            notes.append(NO_VALUE_NOTE)
+            return None
+        if cur == currency:
+            total += value
+            continue
+        if {cur, currency} != {"USD", "CAD"}:
+            notes.append(OTHER_CCY_NOTE)
+            return None
+        rate = fx.get()
+        if rate is None:
+            notes.append(fx.why())
+            return None
+        total += value * rate.rate if cur == "USD" else value / rate.rate
+    cash = balance - total
+    if cash < 0:
+        if -cash <= min(abs(balance) * CLAMP, CLAMP_MAX):
+            return Decimal(0)
+        notes.append(NEGATIVE_NOTE)
+        return None
+    return cash
+
+
+def _derive(rows: list[dict], held: list[dict], fx_source: Callable[[], Any] | None, notes: list[str]) -> dict | None:
+    """Adds kind, kind_basis, tax, cash_estimate, _investment and _empty to each account row, and returns the FX
+    block when a rate was used. Only Plaid investment accounts get a cash estimate: a CSV balance is a holdings
+    value that leaves cash out."""
+    positions: dict[str, list[dict]] = defaultdict(list)
+    for h in held:
+        if h["source"] == "plaid":
+            positions[h["account_id"]].append(h)
+    fx = _FxOnce(fx_source)
+    estimated = False
+    for r in rows:
+        mine = positions.get(r["id"], []) if r["source"] == "plaid" else []
+        known = r["source"] == "plaid" and r["type"] in INVESTMENT_ACCOUNT_TYPES and r.get("_held", False)
+        # a CSV row keeps its registration type in "type" (its subtype is None)
+        reported = r["subtype"] if r["source"] == "plaid" else r["type"]
+        kind, basis, note = account_kind(reported, r["name"], no_holdings=known and not mine)
+        if note:
+            notes.append(note)
+        balance = _dec(r["current"])
+        estimate = None
+        # an unrecognised account with no holdings may hold assets Plaid doesn't list (crypto): no estimate
+        if known and balance is not None and r["currency"] and (mine or kind != "other"):
+            estimate = _cash_estimate(balance, r["currency"], mine, fx, notes)
+            estimated = estimated or estimate is not None
+        r.update(kind=kind, kind_basis=basis, tax=TAX.get(kind, "n/a"), cash_estimate=estimate, _investment=known,
+                 _empty=balance is not None and balance == 0 and not mine)
+    if estimated:
+        notes.append(CASH_NOTE)
+    return fx.used.block() if fx.used else None
+
+
 # ---- output formatting ---------------------------------------------------------------------------------------
 
 CENT = Decimal("0.01")
@@ -630,17 +804,27 @@ def _account_filter(account: str | None):
 def accounts(backend: Backend, detail: str = "concise") -> dict:
     full = _full(detail)
     notes = _start(backend)
-    rows, *_ = backend._merged_accounts(notes)
+    # holdings are optional here: an item whose holdings fail still lists its accounts, without cash estimates
+    rows, _, _, _, plaid_held = backend._merged_accounts(notes, holdings="optional")
+    fx = _derive(rows, plaid_held, backend.fx, notes)
     out = []
+    hidden = 0
     for r in rows:
-        row = {"id": r["id"], "name": _text(r["name"], full),
-               "type": r["type"] if full else (r["subtype"] or r["type"]), "last4": r["mask"],
-               "currency": r["currency"], "balance": _money(r["current"])}
+        if r["_empty"] and not full:
+            hidden += 1
+            continue
+        row = {"id": r["id"], "name": _text(r["name"], full), "account_kind": r["kind"], "kind_basis": r["kind_basis"],
+               "tax": r["tax"], "last4": r["mask"], "currency": r["currency"], "balance": _money(r["current"]),
+               "cash_estimate": _money(r["cash_estimate"])}
         if full:
-            row |= {"subtype": r["subtype"], "available": _money(r["available"]), "limit": _money(r["limit"]),
-                    "basis": r["basis"], "as_of": r["as_of"], "source": r["source"]}
+            row |= {"type": r["type"], "subtype": r["subtype"], "available": _money(r["available"]),
+                    "limit": _money(r["limit"]), "basis": r["basis"], "as_of": r["as_of"], "source": r["source"]}
+        elif r["kind"] == "other":  # the raw label is then the only hint, such as crypto
+            row["type"] = r["subtype"] or r["type"]
         out.append(row)
-    return _result(notes, accounts=out)
+    if hidden:
+        notes.append(HIDDEN_NOTE)
+    return _result(notes, accounts=out, hidden_empty=hidden or None, fx=fx)
 
 
 def holdings(backend: Backend, account: str | None = None, detail: str = "concise",
@@ -715,16 +899,18 @@ def transactions(backend: Backend, days: int = 90, account: str | None = None, s
 
 
 def summary(backend: Backend, currency: str = "CAD") -> dict:
-    """Net worth and allocation, totalled separately per currency; nothing is converted.
+    """Net worth and allocation, totalled separately per currency; nothing is converted except inside cash estimates.
 
     Net worth and by_account_type come from account balances only (basis "account_balances"): a Plaid balance is the
     institution's own total, already in the account's currency, so holdings are never added to it. by_security_type
     comes from holdings, grouped by each holding's currency (US-listed holdings in USD, see holding_currency). A
     currency that only holdings use, such as USD inside a CAD account, therefore has an allocation but no net worth.
+    by_kind, cash_total_estimate and invested_total are for the requested currency only; see _kind_totals.
     """
     notes = _start(backend)
     rows, _, csv_accts, match, plaid_held = backend._merged_accounts(notes, holdings=True)
     held = backend._holdings_from(csv_accts, match, plaid_held, notes)
+    fx = _derive(rows, plaid_held, backend.fx, notes)
     net: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
     assets: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
     secs: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
@@ -744,16 +930,10 @@ def summary(backend: Backend, currency: str = "CAD") -> dict:
         if value is not None and h["currency"] and value > 0:
             secs[h["currency"]][h["security_type"] or "unclassified"] += value
 
-    def table(values: dict[str, Decimal], shares: dict[str, Decimal]) -> dict:
-        # percentages are shares of positive asset balances; liabilities carry a value but no share
-        total = sum(shares.values(), Decimal())
-        ordered = sorted(values.items(), key=lambda kv: -kv[1])
-        return {k: {"value": _money(v), "pct": _pct(shares[k], total) if k in shares else None} for k, v in ordered}
-
     by_currency = {
         cur: {"net_worth": _money(sum(net[cur].values(), Decimal())) if cur in net else None,
-              "by_account_type": table(net.get(cur, {}), assets.get(cur, {})),
-              "by_security_type": table(secs.get(cur, {}), secs.get(cur, {}))}
+              "by_account_type": _table(net.get(cur, {}), assets.get(cur, {})),
+              "by_security_type": _table(secs.get(cur, {}), secs.get(cur, {}))}
         for cur in sorted(set(net) | set(secs))
     }
     primary = currency.strip().upper()
@@ -763,8 +943,55 @@ def summary(backend: Backend, currency: str = "CAD") -> dict:
     if len(by_currency) > 1:
         notes.append("Several currencies: each is totalled separately, percentages are within each currency, "
                      "nothing is converted.")
+    derived = _kind_totals(rows, primary, notes)
     return _result(notes, currency=primary, net_worth=by_currency.get(primary, {}).get("net_worth") or "0.00",
-                   basis="account_balances", by_currency=by_currency)
+                   basis="account_balances", **derived, fx=fx, by_currency=by_currency)
+
+
+def _table(values: dict[str, Decimal], shares: dict[str, Decimal]) -> dict:
+    # percentages are shares of positive asset balances; liabilities carry a value but no share
+    total = sum(shares.values(), Decimal())
+    ordered = sorted(values.items(), key=lambda kv: -kv[1])
+    return {k: {"value": _money(v), "pct": _pct(shares[k], total) if k in shares else None} for k, v in ordered}
+
+
+def _kind_totals(rows: list[dict], currency: str, notes: list[str]) -> dict:
+    """by_kind, cash_total_estimate and invested_total over the accounts held in `currency` (rows already derived).
+
+    Cash is chequing and cash-account balances plus each investment account's cash_estimate; invested is investment
+    balances minus their cash_estimate, plus CSV balances (holdings values, which leave cash out). An investment
+    account without an estimate is left out of both totals, with a note.
+    """
+    values: dict[str, Decimal] = defaultdict(Decimal)
+    assets: dict[str, Decimal] = defaultdict(Decimal)
+    cash, invested, missing = Decimal(), Decimal(), 0
+    for r in rows:
+        value = _dec(r["current"])
+        if value is None or r["currency"] != currency or value == 0:
+            continue
+        if r["type"] in LIABILITY_TYPES or r["kind"] in LIABILITY_KINDS:
+            values[r["kind"]] -= value
+            continue
+        values[r["kind"]] += value
+        if value > 0:
+            assets[r["kind"]] += value
+        if r["_investment"]:
+            if r["cash_estimate"] is None:
+                missing += 1
+            else:
+                cash += r["cash_estimate"]
+                invested += value - r["cash_estimate"]
+        elif r["basis"] == "holdings_market_value":  # a CSV balance is a holdings value, even for a CASH account
+            invested += value
+        elif r["kind"] in ("chequing", "cash"):
+            cash += value
+    if not values:
+        return {}
+    notes.append(SUMMARY_NOTE)
+    if missing:
+        notes.append(f"cash_total_estimate and invested_total leave out {missing} investment account(s) without a "
+                     "cash_estimate.")
+    return {"by_kind": _table(values, assets), "cash_total_estimate": _money(cash), "invested_total": _money(invested)}
 
 
 def health(backend: Backend) -> dict:

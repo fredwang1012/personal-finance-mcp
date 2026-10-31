@@ -141,6 +141,11 @@ hardware. To change the uv version, update `UV_VERSION` and both hashes together
 
 It does not start anything.
 
+The unit's sandbox allows outbound IPv4 and IPv6 (`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, no IP
+allow-list), which the service needs for Plaid. The same path carries its only other request: a GET to
+`www.bankofcanada.ca` for the public USD/CAD rate behind cash estimates. Set `FX_ENABLED=false` in the env file to
+make Plaid the only outbound connection.
+
 Edit the settings:
 
 ```bash

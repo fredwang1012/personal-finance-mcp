@@ -4,18 +4,19 @@
 
 Reports the size of the tools/list payload and of each tool's tools/call result (default arguments), in characters
 and approximate tokens (chars / 4). Plaid is replaced by an in-script fake and the store is a throwaway SQLite file,
-so the keychain, the network and the real data directory are never touched.
+so the keychain, the network (Plaid and the Bank of Canada) and the real data directory are never touched.
 """
 import asyncio
 import json
 import sys
 import tempfile
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import server, store, tools  # noqa: E402
+from app import fx, server, store, tools  # noqa: E402
 
 TODAY = date(2026, 3, 10)
 
@@ -65,7 +66,8 @@ def _dump(model) -> str:
 
 async def measure(tmp: Path) -> None:
     def backend():
-        b = tools.Backend(store.connect(tmp / "m.db"), SyntheticPlaid(), {"synthetic-item": "synthetic-token"})
+        b = tools.Backend(store.connect(tmp / "m.db"), SyntheticPlaid(), {"synthetic-item": "synthetic-token"},
+                          fx=lambda: fx.Rate(Decimal("1.25"), TODAY.isoformat()))  # made up; no Bank of Canada call
         b.today = lambda: TODAY
         return b
 

@@ -14,17 +14,48 @@ context. `detail: "full"` adds the less common fields.
 
 | Tool | Returns |
 | --- | --- |
-| `accounts` | Each account: short id, name, type, last 4, currency, balance. Full adds subtype, available, limit, basis, as_of, source |
+| `accounts` | Each account: short id, name, `account_kind` with `kind_basis` and `tax`, last 4, currency, balance and `cash_estimate`. Empty accounts (zero balance, no holdings) are counted as `hidden_empty`. Full lists them and adds type, subtype, available, limit, basis, as_of, source |
 | `holdings` | Positions sorted by value: symbol, quantity, value, currency, account last 4, plus totals per currency. Filter by account id, last 4 or name; 50 rows by default (`limit`, max 500). Full adds name, price, cost basis, security type |
 | `transactions` | Investment activity from Plaid plus CSV imports for the last `days` (default 90, max 730), newest first, `limit` rows (default 25, max 200), with count, omitted count and money in/out per currency. Filters: `account`, `symbol`, `kind` (`buy`, `dividend`, ... or `investment`). Concise rows carry the description only when there is no symbol |
-| `summary` | Net worth (from account balances, `basis: account_balances`) and allocation by account type and by security type, per currency, with the total in the requested currency (default CAD). Security-type allocation comes from holdings within each currency |
+| `summary` | Net worth (from account balances, `basis: account_balances`) and allocation by account type and by security type, per currency, with the total in the requested currency (default CAD). Security-type allocation comes from holdings within each currency. For the requested currency it adds `by_kind`, `cash_total_estimate` and `invested_total` |
 | `health` | Per linked Plaid item: institution, products, last successful update, error code |
 
 Conventions shared by every tool are stated once, in the server instructions: amounts are decimal strings rounded to
-cents (quantities to 6 decimals), currencies are never converted, transaction amounts are negative for money out, and
+cents (quantities to 6 decimals), currencies are never converted except in cash estimates, transaction amounts are negative for money out, and
 every string field is untrusted data from financial institutions. Results carry a `notes` list only when there is
 something to know: a failed Plaid item, a CSV account that may be counted twice, mixed currencies, missing keys,
 or US-listed holdings that the institution labelled CAD (shown in USD based on their exchange).
+
+### What the Plaid data means
+
+The server works out what Wealthsimple's raw Plaid data means, so Claude doesn't have to guess:
+
+- **Balances are right; cash is missing.** `balances.current` is the account's total in its own currency (CAD),
+  cash included. Plaid never reports a cash figure: `available` is always null and holdings have no cash position.
+  So each Plaid investment account gets `cash_estimate` = balance minus holdings. USD holdings are first converted at
+  the Bank of Canada rate, shown once per response as `fx` with its date. The estimate is omitted, with a note, when
+  the rate can't be fetched, a holding is in another currency, or holdings exceed the balance by more than 1% (stale
+  or incomplete holdings). A smaller shortfall (at most 1% and $50) is FX and price timing, shown as 0. A generic
+  brokerage account with no holdings is all cash; an unrecognised one (such as crypto) gets no estimate, since its
+  assets may simply not be listed.
+- **Account kind.** Plaid's subtype is often generic: `brokerage` covers the FHSA and non-registered accounts. So
+  `account_kind` (tfsa, fhsa, rrsp, resp, rrif, rdsp, lira, non_registered, cash, chequing, credit_card,
+  line_of_credit or other) comes from the subtype (for CSV accounts, the export's account type), then from keywords
+  in the name (FHSA, TFSA, RRSP, non-registered, margin, individual; a registered plan wins, so "Individual TFSA"
+  is a TFSA), then `cash` for a generic brokerage account with no holdings. Locked-in plans (LRSP, LIF, LRIF, PRIF,
+  RLIF) are reported as lira. `kind_basis` says which (`none` when no subtype was reported), and `tax` gives the
+  treatment (tax-free, tax-deferred, taxable or n/a). A generic subtype with an uninformative name stays `other`;
+  the kind is never guessed.
+- **Summary.** `by_kind` is from balances. `cash_total_estimate` is chequing and cash-account balances plus the
+  investment accounts' cash estimates; `invested_total` is investment balances minus those estimates. CSV-only
+  balances are holdings values, so they count as invested.
+
+**Outbound requests.** Besides Plaid, the server makes one request: a GET to
+`https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?recent=1` for the public USD/CAD rate (Bank of Canada
+Valet API, no key). It carries no personal data, only goes to that allow-listed host, ignores proxy settings,
+refuses redirects, gives up after 8 seconds, accepts only a rate with at most 8 decimals between 0.5 and 3, and is
+cached in memory for 12 hours. It is made only when an estimate needs a conversion. Set
+`FX_ENABLED=false` to turn it off; estimates that need it are then omitted with a note.
 
 Plaid responses are cached in memory for 5 minutes per process, keyed by item, a digest of its access token and
 endpoint, and only the fields the tools read are kept. Investment transactions are fetched for a fixed 730-day window
@@ -202,6 +233,9 @@ is in [docs/REMOTE.md](docs/REMOTE.md), from the Oracle VM to revoking everythin
   per-response nonce, and forbids framing. In update mode
   (`link --update`) there is no token exchange: the page reports success once, with the same state token and checks,
   and nothing is stored.
+- **One public outbound request besides Plaid.** Cash estimates use the USD/CAD rate from the Bank of Canada Valet
+  API: one GET to a fixed URL on an allow-listed host, with no parameters, cookies or credentials, so nothing about
+  you is sent. `FX_ENABLED=false` turns it off.
 - **Local only by default.** The stdio server speaks to the Claude app on this machine and opens no port. The optional
   remote connector (`serve-http`) listens on 127.0.0.1 behind Tailscale Funnel. Every request needs an OAuth token
   that is bound to its URL and issued only after your GitHub login and your approval on the server. See
@@ -250,7 +284,10 @@ are comfortable with that for the fields above.
 
 - **No bank transactions.** Only investment transactions are fetched from Plaid. Chequing and card spending are not
   covered.
-- **No currency conversion.** CAD and USD (and anything else) are always reported separately.
+- **No currency conversion,** except inside cash estimates. CAD and USD (and anything else) are otherwise always
+  reported separately.
+- **Cash is estimated.** Plaid doesn't report cash, so `cash_estimate` is balance minus holdings at the Bank of Canada
+  rate. It can differ slightly from the broker's figure, which uses its own FX rate and price timing.
 - **CSV balances are holdings market value** as of the latest snapshot date (`as_of`). Cash in those accounts is not
   included.
 - **Merge rules.** Plaid wins when both sources cover an account. A CSV account merges into a Plaid account only when
@@ -276,8 +313,8 @@ are comfortable with that for the fields above.
 py -3.12 -m uv run pytest -q
 ```
 
-No test uses the network, a real Plaid account or the real keychain: Plaid is faked and every test runs with an
-in-memory keyring. `tests/test_e2e.py` starts `python -m app.server` as a subprocess and speaks MCP over stdio
+No test uses the network, a real Plaid account or the real keychain: Plaid and the Bank of Canada rate are faked
+(the real FX opener raises in tests) and every test runs with an in-memory keyring. `tests/test_e2e.py` starts `python -m app.server` as a subprocess and speaks MCP over stdio
 (initialize, tools/list, tools/call) in a test-only mode. That mode is switched on by `PFMCP_FAKE_PLAID=1` and is
 honoured only when `PYTEST_CURRENT_TEST` is set (pytest sets it for each test) and `DATA_DIR` is inside pytest's
 temp directory, so it cannot turn on in a real setup; otherwise it is ignored with a warning on stderr.
