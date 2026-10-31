@@ -85,7 +85,7 @@ def test_set_plaid_keys_reports_lengths_not_values(monkeypatch, capsys):
     monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(answers))
     assert cli.main(["set-plaid-keys"]) == 0
     out = capsys.readouterr().out
-    assert "...e392 (24 characters)" in out and "secret has 30 characters" in out
+    assert "...4567 (24 characters)" in out and "secret has 30 characters" in out
     assert "0123456789abcdef" not in out
     assert secrets.get_plaid_secret(cli.settings.plaid_env) == "0123456789abcdef0123456789abcd"
 
