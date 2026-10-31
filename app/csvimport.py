@@ -10,11 +10,17 @@ How to get them (Wealthsimple web, per the help centre; menu labels change over 
   * Monthly statements are available as CSV via Documents -> Custom download -> Bulk download monthly statements;
     files with the same columns as above are imported the same way.
 Then run: python -m app.cli import-csv PATH...
-Re-importing a file is safe: rows are de-duplicated by a stable hash. Reports never echo row contents.
+Re-importing a file is safe: transactions are de-duplicated by a stable hash; holdings are keyed on
+(account, as-of date, symbol) and the latest import wins. Reports never echo row contents.
+Privacy: only the last 4 characters of an account number are stored, and any long digit run in a text field is
+masked. Transaction `amount` is stored exactly as exported (sign included). Decimal-comma amounts are converted;
+ambiguous ones such as "1,234" are rejected rather than guessed.
 """
 import csv
 import hashlib
+import io
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -22,10 +28,14 @@ from pathlib import Path
 
 from app.store import connect
 
+MAX_BYTES = 50 * 1024 * 1024
+MAX_TEXT = 300
+BULLETS = "•••"
+
 # canonical field -> accepted normalized header names, in priority order
 ALIASES = {
     "date": ["transaction_date", "date", "trade_date", "settlement_date"],
-    "as_of": ["as_of_date", "as_of", "date", "statement_date"],
+    "as_of": ["as_of_date", "as_of", "date", "statement_date", "report_date"],
     "account_name": ["account_name", "account_nickname", "account", "nickname"],
     "account_type": ["account_type", "registration_type"],
     "account_number": ["account_number", "account_no", "account_id", "account_num"],
@@ -42,17 +52,24 @@ ALIASES = {
     "description": ["description", "memo", "details", "name"],
 }
 
-# first keyword found wins, so order matters (e.g. a "dividend reinvestment" is a dividend)
-TYPE_KEYWORDS = [
-    ("dividend", ("div",)),
-    ("interest", ("interest",)),
-    ("fee", ("fee", "commission")),
-    ("buy", ("buy", "purchase", "drip")),
-    ("sell", ("sell", "sale")),
-    ("transfer", ("transfer", "trf")),
-    ("deposit", ("deposit", "contribution")),
-    ("withdrawal", ("withdraw",)),
+# first match wins, so order matters (e.g. a "dividend reinvestment" is a dividend); prefixes at word starts only,
+# so "div" matches "DIV"/"Dividend" but not "Individual"
+TYPE_RES = [
+    (name, re.compile(pat))
+    for name, pat in [
+        ("dividend", r"\bdiv"),
+        ("interest", r"\binterest"),
+        ("fee", r"\b(?:fee|commission)"),
+        ("buy", r"\b(?:buy|purchase|drip)"),
+        ("sell", r"\b(?:sell|sale)"),
+        ("transfer", r"\b(?:transfer|trf)"),
+        ("deposit", r"\b(?:deposit|contribution)"),
+        ("withdrawal", r"\bwithdraw"),
+    ]
 ]
+DIGIT_RUN = re.compile(r"\d(?:[ -]?\d){5,}")
+NUMBER_LIKE = re.compile(r"[\d \-]{6,}")
+NUMERIC = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 
 
 class RowError(ValueError):
@@ -63,6 +80,7 @@ class RowError(ValueError):
 class ImportResult:
     kind: str = ""
     added: int = 0
+    updated: int = 0
     duplicates: int = 0
     rejected: list[tuple[int, str]] = field(default_factory=list)
 
@@ -91,6 +109,23 @@ def detect_kind(headers: set[str]) -> str | None:
     return None
 
 
+def _last4(number: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", number)[-4:]
+
+
+def _mask(match: re.Match) -> str:
+    return BULLETS + re.sub(r"\D", "", match.group())[-4:]
+
+
+def _text(raw: str, number: str = "") -> str:
+    """Free text that may reach model context: drop control chars, mask account numbers, cap the length."""
+    out = "".join(ch for ch in raw if not unicodedata.category(ch).startswith("C")).strip()
+    if len(number) >= 4:
+        out = out.replace(number, BULLETS + _last4(number))
+    out = DIGIT_RUN.sub(_mask, out)
+    return out[:MAX_TEXT]
+
+
 def _date(raw: str) -> str:
     if not raw:
         raise RowError("missing date")
@@ -106,117 +141,206 @@ def _decimal(raw: str, label: str, required: bool = False) -> str:
         if required:
             raise RowError(f"missing {label}")
         return ""
-    text = raw.replace("$", "").replace(",", "").replace(" ", "")
+    text = re.sub(r"[\s  $]", "", raw)
     if text.startswith("(") and text.endswith(")"):
         text = "-" + text[1:-1]
+    if text.endswith("-"):
+        text = "-" + text[:-1]
+    if "," in text:
+        if "." in text:
+            # "1.234,56" (comma last) is European; "1,234.56" is English
+            if text.rfind(",") > text.rfind("."):
+                text = text.replace(".", "").replace(",", ".")
+            else:
+                text = text.replace(",", "")
+        else:
+            groups = text.split(",")
+            if len(groups) == 2 and re.fullmatch(r"\d{1,2}", groups[1]):
+                text = groups[0] + "." + groups[1]
+            elif len(groups) > 2 and all(re.fullmatch(r"\d{3}", g) for g in groups[1:]):
+                text = "".join(groups)
+            elif len(groups) == 2 and re.fullmatch(r"\d{3}", groups[1]):
+                raise RowError(f"ambiguous {label} (comma could be decimal or thousands)")
+            else:
+                raise RowError(f"invalid {label}")
+    if len(text) > 40 or not NUMERIC.fullmatch(text):
+        raise RowError(f"invalid {label}")
     try:
         d = Decimal(text)
     except InvalidOperation:
         raise RowError(f"invalid {label}") from None
-    if not d.is_finite():
-        raise RowError(f"invalid {label}")
+    if d != 0 and not (-12 <= d.adjusted() <= 15):
+        raise RowError(f"{label} out of range")
     return "0" if d == 0 else format(d.normalize(), "f")
 
 
-def _activity_type(raw: str, sub: str) -> str:
-    text = f"{raw} {sub}".lower()
-    for canonical, words in TYPE_KEYWORDS:
-        if any(w in text for w in words):
+def _activity_type(text: str) -> str:
+    text = text.lower().replace("_", " ")
+    for canonical, pattern in TYPE_RES:
+        if pattern.search(text):
             return canonical
     return "other"
-
-
-def _last4(number: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", number)[-4:]
 
 
 def _hash(*parts: str) -> str:
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
 
 
-def _account(row: dict[str, str]) -> tuple[str, str, str, str]:
-    name = _pick(row, "account_name")
-    type_ = _pick(row, "account_type")
-    mask = _last4(_pick(row, "account_number"))
+def _account(row: dict[str, str]) -> tuple[str, str, str, str, str]:
+    """Returns (id, name, type, last4, raw number); the raw number is only used to redact other fields."""
+    number = _pick(row, "account_number")
+    name_raw = _pick(row, "account_name")
+    if not number and NUMBER_LIKE.fullmatch(name_raw):
+        number = name_raw  # an "Account" column that holds the number itself
+    name = _text(name_raw, number)
+    type_ = _text(_pick(row, "account_type"), number)
+    mask = _last4(number)
     if not (name or type_ or mask):
         raise RowError("missing account")
     # the id derives from non-secret fields only, so the full number never reaches the store
-    return _hash("csv-account", name, type_, mask)[:16], name or type_, type_, mask
+    return _hash("csv-account", name, type_, mask)[:16], name or type_, type_, mask, number
+
+
+def _decode(raw: bytes) -> str:
+    try:
+        if raw.startswith(b"\xef\xbb\xbf"):
+            return raw.decode("utf-8-sig")
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return raw.decode("utf-16")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw.decode("cp1252")
+    except UnicodeDecodeError:
+        raise ValueError("unsupported text encoding") from None
+
+
+def _records(text: str):
+    """Yield (first line number, row) so reports point at real file lines even with quoted newlines."""
+    reader = csv.reader(io.StringIO(text, newline=""))
+    prev = 0
+    for row in reader:
+        start = prev + 1
+        prev = reader.line_num
+        if row:
+            yield start, row
 
 
 def import_file(path: Path, conn, now: datetime | None = None) -> ImportResult:
-    raw = Path(path).read_bytes()
+    path = Path(path)
+    if path.stat().st_size > MAX_BYTES:
+        raise ValueError("file is larger than 50 MB")
+    raw = path.read_bytes()
     file_sha = hashlib.sha256(raw).hexdigest()
-    imported_at = (now or datetime.now(UTC)).isoformat(timespec="seconds")
+    now = now or datetime.now(UTC)
+    imported_at = now.isoformat(timespec="seconds")
+    text = _decode(raw)
+
+    records = _records(text)
     try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise ValueError("file is not UTF-8 text") from None
-    reader = csv.DictReader(text.splitlines(), restkey="_extra")
-    if reader.fieldnames is None:
-        raise ValueError("file is empty")
-    reader.fieldnames = [_norm_header(h) for h in reader.fieldnames]
-    kind = detect_kind(set(reader.fieldnames))
-    if kind is None:
-        raise ValueError("unrecognised Wealthsimple export format (see app/csvimport.py docstring)")
-
-    result = ImportResult(kind=kind)
-    seen: dict[str, int] = {}  # identical rows inside one file are real repeats (e.g. two equal fills), keep both
-    for row in reader:
-        line = reader.line_num
-        try:
-            account = _account(row)
-            if kind == "activities":
-                date = _date(_pick(row, "date"))
-                type_ = _activity_type(_pick(row, "type"), _pick(row, "sub_type"))
-                symbol = _pick(row, "symbol").upper()
-                qty = _decimal(_pick(row, "quantity"), "quantity")
-                price = _decimal(_pick(row, "price"), "price")
-                amount = _decimal(_pick(row, "amount"), "amount", required=True)
-                currency = _pick(row, "currency").upper()
-                desc = _pick(row, "description")
-                if not currency:
-                    raise RowError("missing currency")
-                key = _hash(kind, date, account[3], type_, symbol, qty, amount, currency, desc)
-            else:
-                symbol = _pick(row, "symbol").upper()
-                if not symbol:
-                    raise RowError("missing symbol")
-                as_of = _date(_pick(row, "as_of")) if _pick(row, "as_of") else ""
-                qty = _decimal(_pick(row, "quantity"), "quantity", required=True)
-                price = _decimal(_pick(row, "price"), "price")
-                mv = _decimal(_pick(row, "market_value"), "market value")
-                bv = _decimal(_pick(row, "book_value"), "book value")
-                currency = _pick(row, "currency").upper()
-                if not currency:
-                    raise RowError("missing currency")
-                key = _hash(kind, as_of, account[3], "", symbol, qty, mv, currency, "")
-        except RowError as exc:
-            result.rejected.append((line, str(exc)))
-            continue
-
-        seen[key] = seen.get(key, 0) + 1
-        row_hash = key if seen[key] == 1 else _hash(key, str(seen[key]))
-        conn.execute(
-            "INSERT OR IGNORE INTO accounts VALUES (?,?,?,?,'csv',?,?)",
-            (account[0], account[1], account[2], account[3], imported_at, file_sha),
-        )
-        if kind == "activities":
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,'csv',?,?)",
-                (row_hash, account[0], date, type_, symbol, qty, price, amount, currency, desc, imported_at, file_sha),
-            )
-        else:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO holdings VALUES (?,?,?,?,?,?,?,?,?,?,'csv',?,?)",
-                (row_hash, account[0], as_of, symbol, _pick(row, "name"), qty, price, mv, bv, currency, imported_at, file_sha),
-            )
-        if cur.rowcount:
-            result.added += 1
-        else:
-            result.duplicates += 1
+        first = next(records, None)
+        if first is None:
+            raise ValueError("file is empty")
+        headers = [_norm_header(h) for h in first[1]]
+        if len(set(headers)) != len(headers):
+            raise ValueError("duplicate column names after normalisation")
+        kind = detect_kind(set(headers))
+        if kind is None:
+            raise ValueError("unrecognised Wealthsimple export format (see app/csvimport.py docstring)")
+        result = ImportResult(kind=kind)
+        seen: dict[str, int] = {}  # identical rows inside one file are real repeats (e.g. two equal fills)
+        for line, values in records:
+            if len(values) > len(headers):
+                result.rejected.append((line, "more cells than header columns"))
+                continue
+            try:
+                _import_row(conn, kind, dict(zip(headers, values)), seen, result, file_sha, imported_at, now)
+            except RowError as exc:
+                result.rejected.append((line, str(exc)))
+    except csv.Error:
+        conn.rollback()
+        raise ValueError("malformed CSV (e.g. a cell larger than the parser limit)") from None
+    except ValueError:
+        conn.rollback()
+        raise
     conn.commit()
     return result
+
+
+def _import_row(conn, kind, row, seen, result, file_sha, imported_at, now) -> None:
+    account = _account(row)
+    number = account[4]
+    currency = _pick(row, "currency").upper()
+    if not currency:
+        raise RowError("missing currency")
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise RowError("invalid currency")
+    symbol = _text(_pick(row, "symbol"), number).upper()
+    if kind == "activities":
+        date = _date(_pick(row, "date"))
+        raw_type = _text(" / ".join(p for p in (_pick(row, "type"), _pick(row, "sub_type")) if p), number)
+        type_ = _activity_type(raw_type)
+        qty = _decimal(_pick(row, "quantity"), "quantity")
+        price = _decimal(_pick(row, "price"), "price")
+        amount = _decimal(_pick(row, "amount"), "amount", required=True)
+        desc = _text(_pick(row, "description"), number)
+        # the description is left out so a reworded re-export still dedupes; the counter keeps true repeats
+        key = _hash(kind, date, account[0], type_, symbol, qty, amount, currency)
+        seen[key] = seen.get(key, 0) + 1
+        row_hash = key if seen[key] == 1 else _hash(key, str(seen[key]))
+        _save_account(conn, account, imported_at, file_sha)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO transactions (row_hash, account_id, date, type, raw_type, symbol, quantity, price,"
+            " amount, currency, description, source, imported_at, file_sha256)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,'csv',?,?)",
+            (row_hash, account[0], date, type_, raw_type, symbol, qty, price, amount, currency, desc, imported_at, file_sha),
+        )
+        result.added += cur.rowcount
+        result.duplicates += 1 - cur.rowcount
+        return
+
+    if not symbol:
+        raise RowError("missing symbol")
+    as_of_raw = _pick(row, "as_of")
+    as_of = _date(as_of_raw) if as_of_raw else now.date().isoformat()
+    values = (
+        _text(_pick(row, "name"), number),
+        _decimal(_pick(row, "quantity"), "quantity", required=True),
+        _decimal(_pick(row, "price"), "price"),
+        _decimal(_pick(row, "market_value"), "market value"),
+        _decimal(_pick(row, "book_value"), "book value"),
+        currency,
+    )
+    _save_account(conn, account, imported_at, file_sha)
+    existing = conn.execute(
+        "SELECT name, quantity, price, market_value, book_value, currency FROM holdings"
+        " WHERE account_id=? AND as_of=? AND symbol=?",
+        (account[0], as_of, symbol),
+    ).fetchone()
+    if existing == values:
+        result.duplicates += 1
+        return
+    conn.execute(
+        "INSERT INTO holdings (account_id, as_of, as_of_inferred, symbol, name, quantity, price, market_value,"
+        " book_value, currency, source, imported_at, file_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,'csv',?,?)"
+        " ON CONFLICT (account_id, as_of, symbol) DO UPDATE SET as_of_inferred=excluded.as_of_inferred,"
+        " name=excluded.name, quantity=excluded.quantity, price=excluded.price, market_value=excluded.market_value,"
+        " book_value=excluded.book_value, currency=excluded.currency, source='csv',"
+        " imported_at=excluded.imported_at, file_sha256=excluded.file_sha256",
+        (account[0], as_of, 0 if as_of_raw else 1, symbol, *values, imported_at, file_sha),
+    )
+    if existing:
+        result.updated += 1
+    else:
+        result.added += 1
+
+
+def _save_account(conn, account, imported_at: str, file_sha: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO accounts (account_id, name, type, mask, source, imported_at, file_sha256)"
+        " VALUES (?,?,?,?,'csv',?,?)",
+        (account[0], account[1], account[2], account[3], imported_at, file_sha),
+    )
 
 
 def import_paths(paths: list[str]) -> int:
@@ -233,7 +357,11 @@ def import_paths(paths: list[str]) -> int:
                 print(f"{path.name}: not imported ({reason})")
                 failed = True
                 continue
-            print(f"{path.name} [{res.kind}]: added {res.added}, duplicates skipped {res.duplicates}, rejected {len(res.rejected)}")
+            updated = f", updated {res.updated}" if res.updated else ""
+            print(
+                f"{path.name} [{res.kind}]: added {res.added}{updated}, duplicates skipped {res.duplicates},"
+                f" rejected {len(res.rejected)}"
+            )
             for line, reason in res.rejected:
                 print(f"  line {line}: {reason}")
     finally:
