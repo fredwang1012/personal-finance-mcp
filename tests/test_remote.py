@@ -746,8 +746,69 @@ def test_junk_client_ids_do_not_reset_the_token_cap(tmp_path, plaid):
                                          "client_id": f"junk-{i}"}).status_code for i in range(20)]
         assert codes[:5].count(429) == 0 and set(codes[5:]) == {429}
         limiter = c.app.limiter
-        assert not [k for k in limiter.hits if k.startswith("token:junk") and int(k.split("-")[1]) >= 5]
+        every_key = [*limiter.hits, *limiter.client_hits, *limiter.global_hits]
+        assert not [k for k in every_key if "junk" in k]  # junk ids are counted per network, not per id
     provider.close()
+
+
+def test_ip_buckets_aggregate_networks():
+    from app.remote import ip_bucket
+
+    assert ip_bucket("203.0.113.7") == ip_bucket("203.0.113.250") == "203.0.113.0/24"
+    assert ip_bucket("2001:db8:1:2::5") == ip_bucket("2001:db8:1:2:ffff::1") == "2001:db8:1:2::/64"
+    assert ip_bucket("testclient") == "testclient"
+
+
+def test_anonymous_key_flood_cannot_block_the_owner(tmp_path, plaid, monkeypatch):
+    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 20)
+    limits = Limits(token_global=(1000, 60))
+    app, provider, _ = make(tmp_path, limits=limits)
+    with TestClient(app, base_url=PUBLIC) as owner:
+        client_id, tokens = full_login(owner, provider)
+        limiter = owner.app.limiter
+        # 10x MAX_KEYS distinct networks: fills the anonymous map, then drains the shared overflow bucket
+        for i in range(200):
+            stranger = TestClient(app, base_url=PUBLIC, client=(f"10.{i // 250}.{i % 250}.9", 4000))
+            stranger.get("/.well-known/oauth-authorization-server")
+        assert len(limiter.hits) <= 20 and limiter.hit("brand-new", (5, 60))  # overflow really is drained
+        r = owner.post("/token", data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+                                       "client_id": client_id, "resource": RESOURCE})
+        assert r.status_code == 200
+        assert rpc(owner, r.json()["access_token"], "tools/list").status_code == 200
+    provider.close()
+
+
+def test_one_network_at_its_register_cap_spends_no_global_quota(tmp_path, plaid):
+    limits = Limits(register_ip=(2, 3600), register_global=(3, 86400))
+    app, provider, _ = make(tmp_path, limits=limits)
+    with TestClient(app, base_url=PUBLIC) as first:
+        register(first)
+        register(first)
+        for _ in range(10):  # over its own cap: refused, and must not touch the daily total
+            assert first.post("/register", json={"redirect_uris": [CB]}).status_code == 429
+        other = TestClient(app, base_url=PUBLIC, client=("198.51.100.4", 4000))
+        r = other.post("/register", json={"redirect_uris": [CB], "token_endpoint_auth_method": "none"})
+        assert r.status_code == 201  # the third and last global slot was still free
+        third = TestClient(app, base_url=PUBLIC, client=("192.0.2.4", 4000))
+        assert third.post("/register", json={"redirect_uris": [CB]}).status_code == 429  # global cap reached
+    provider.close()
+
+
+def test_full_map_sweep_is_rate_limited(monkeypatch):
+    now = [0.0]
+    limiter = RateLimiter(clock=lambda: now[0])
+    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 5)
+    sweeps = []
+    original = RateLimiter._sweep
+    monkeypatch.setattr(RateLimiter, "_sweep", staticmethod(lambda table, t: (sweeps.append(t), original(table, t))))
+    for i in range(5):
+        limiter.hit(f"live{i}", (5, 60))
+    for i in range(100):  # map full of live keys: new keys go to overflow without a scan each time
+        limiter.hit(f"new{i}", (5, 60))
+    assert len(sweeps) == 1
+    now[0] = 2.0
+    limiter.hit("later", (5, 60))
+    assert len(sweeps) == 2
 
 
 def test_missing_forwarded_address_is_warned_once(tmp_path, plaid, caplog):

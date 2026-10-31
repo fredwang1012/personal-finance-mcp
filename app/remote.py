@@ -5,6 +5,7 @@ app.auth for this exact resource URL. Around the SDK's app sit a body-size cap, 
 of tool names (never arguments or results) and an error guard that never returns a traceback.
 """
 import base64
+import ipaddress
 import json
 import logging
 import time
@@ -55,54 +56,90 @@ class Limits:
     mcp_unauthenticated_ip: tuple[int, int] = (60, 60)
 
 
+def ip_bucket(ip: str) -> str:
+    """Anonymous limits count per network, not per address: /24 for IPv4, /64 for IPv6, so one host cannot mint
+    new keys by rotating addresses within its own allocation."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip[:64]
+    return str(ipaddress.ip_network(f"{addr}/{24 if addr.version == 4 else 64}", strict=False))
+
+
 class RateLimiter:
     """Sliding-window counters in memory. Restarting the service resets them, which is acceptable for one owner.
 
-    - Global buckets (`hit_global`: total registrations, total token requests) live in their own small map that is
-      never evicted, so no flood of other keys can reset them.
-    - Per-key buckets (per IP, per client) are reclaimed only once idle for longer than their window; a live bucket
-      is never dropped. When the per-key map is full, requests with a new key share one strict overflow bucket
-      instead, so rotating keys (spoofed addresses, junk client ids) buys nothing.
+    Three maps, so no traffic in one can push out or drain another:
+    - global (`hit_global`): caps over everyone together; never evicted.
+    - client (`hit_client`): approved OAuth clients (`mcp:{client}`, `token:{client}`); bounded by the number of
+      clients, never routed to the overflow bucket.
+    - anonymous (`hit`): per-network keys. Buckets are reclaimed only once idle for longer than their window; a
+      live bucket is never dropped. When the map is full, new anonymous keys share one strict overflow bucket.
+      The full-map sweep runs at most once per SWEEP_INTERVAL seconds, so a flood cannot make every request scan.
     """
 
     MAX_KEYS = 10000
+    MAX_CLIENT_KEYS = 1000
     OVERFLOW_RULE = (30, 60)
     SWEEP_EVERY = 1000
+    SWEEP_INTERVAL = 1.0
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
-        self.hits: dict[str, tuple[deque, int]] = {}          # per-key: key -> (timestamps, window)
+        self.hits: dict[str, tuple[deque, int]] = {}          # anonymous: key -> (timestamps, window)
+        self.client_hits: dict[str, tuple[deque, int]] = {}   # approved OAuth clients
         self.global_hits: dict[str, tuple[deque, int]] = {}   # never evicted
         self._since_sweep = 0
-
-    def _sweep(self, now: float) -> None:
-        for key in [k for k, (q, window) in self.hits.items() if not q or q[-1] <= now - window]:
-            del self.hits[key]
-        self._since_sweep = 0
+        self._last_sweep = float("-inf")
 
     @staticmethod
-    def _count(table: dict, key: str, rule: tuple[int, int], now: float) -> int | None:
+    def _sweep(table: dict, now: float) -> None:
+        for key in [k for k, (q, window) in table.items() if not q or q[-1] <= now - window]:
+            del table[key]
+
+    @staticmethod
+    def _over(table: dict, key: str, rule: tuple[int, int], now: float) -> int | None:
+        """Seconds to wait if `key` is at its limit, else None; records nothing."""
         limit, window = rule
-        q, _ = table.setdefault(key, (deque(), window))
+        q = table.get(key, (deque(), window))[0]
         while q and q[0] <= now - window:
             q.popleft()
-        if len(q) >= limit:
-            return max(1, int(q[0] + window - now) + 1)
-        q.append(now)
-        return None
+        return max(1, int(q[0] + window - now) + 1) if len(q) >= limit else None
+
+    @staticmethod
+    def _record(table: dict, key: str, rule: tuple[int, int], now: float) -> None:
+        table.setdefault(key, (deque(), rule[1]))[0].append(now)
+
+    def _count(self, table: dict, key: str, rule: tuple[int, int], now: float) -> int | None:
+        retry = self._over(table, key, rule, now)
+        if retry is None:
+            self._record(table, key, rule, now)
+        return retry
 
     def hit_global(self, key: str, rule: tuple[int, int]) -> int | None:
-        """A cap over all clients together; return seconds to wait if over the limit, else None."""
+        """A cap over all clients together. Call it after the per-key checks passed, so one key that is already
+        at its own limit cannot spend the shared quota."""
         return self._count(self.global_hits, key, rule, self.clock())
 
+    def hit_client(self, key: str, rule: tuple[int, int]) -> int | None:
+        """A cap for one approved OAuth client."""
+        now = self.clock()
+        if key not in self.client_hits and len(self.client_hits) >= self.MAX_CLIENT_KEYS:
+            self._sweep(self.client_hits, now)
+        return self._count(self.client_hits, key, rule, now)
+
     def hit(self, key: str, rule: tuple[int, int]) -> int | None:
-        """A per-key cap; return seconds to wait if over the limit, else None."""
+        """A cap for one anonymous key (normally built from ip_bucket)."""
         now = self.clock()
         self._since_sweep += 1
-        if key not in self.hits and (len(self.hits) >= self.MAX_KEYS or self._since_sweep >= self.SWEEP_EVERY):
-            self._sweep(now)
-        if key not in self.hits and len(self.hits) >= self.MAX_KEYS:
-            return self._count(self.global_hits, "overflow", self.OVERFLOW_RULE, now)
+        if key not in self.hits:
+            full = len(self.hits) >= self.MAX_KEYS
+            if (self._since_sweep >= self.SWEEP_EVERY
+                    or (full and now - self._last_sweep >= self.SWEEP_INTERVAL)):
+                self._sweep(self.hits, now)
+                self._since_sweep, self._last_sweep = 0, now
+            if len(self.hits) >= self.MAX_KEYS:
+                return self._count(self.global_hits, "overflow", self.OVERFLOW_RULE, now)
         return self._count(self.hits, key, rule, now)
 
 
@@ -160,6 +197,12 @@ class Guard:
             if not started:
                 await _send_json(guarded_send, 500, {"error": "server_error"})
 
+    def _approved(self, client_id: str) -> bool:
+        if self.provider is None or not client_id:
+            return False
+        row = self.provider._client_row(client_id)
+        return row is not None and row[0] == "approved"
+
     async def _handle(self, scope, receive, send):
         path, method = scope.get("path", ""), scope.get("method", "")
         # uvicorn's proxy_headers puts the Funnel client address here (only 127.0.0.1 is trusted to set it)
@@ -177,17 +220,22 @@ class Guard:
         if length > MAX_BODY:
             return await _send_json(send, 413, {"error": "too_large"})
 
-        lim, rules = self.limiter, self.limits
-        # /mcp is limited after authentication instead (ClientRateLimit), so strangers sharing the owner's
-        # address cannot use up the owner's quota
-        # each entry: (key, rule, is_global); global caps are counted before the per-key ones behind them
-        checks = [] if path == "/mcp" else [(f"ip:{ip}", rules.per_ip, False)]
+        lim, rules, net = self.limiter, self.limits, ip_bucket(ip)
+        is_token = path == "/token" and method == "POST"
+        # /mcp is limited after authentication (ClientRateLimit) and /token once the client is known (below), so
+        # strangers sharing or flooding the owner's network cannot use up the owner's quota
+        checks = [] if path == "/mcp" or is_token else [(f"ip:{net}", rules.per_ip)]
         if path == "/register" and method == "POST":
-            checks += [("register", rules.register_global, True), (f"register:{ip}", rules.register_ip, False)]
+            checks.append((f"register:{net}", rules.register_ip))
         elif path == "/authorize" or path.startswith("/oauth/"):
-            checks.append((f"login:{ip}", rules.login_ip, False))
-        for key, rule, is_global in checks:
-            retry = lim.hit_global(key, rule) if is_global else lim.hit(key, rule)
+            checks.append((f"login:{net}", rules.login_ip))
+        for key, rule in checks:
+            retry = lim.hit(key, rule)
+            if retry:
+                return await _too_many(send, retry)
+        # global caps only after every per-key check passed: one network at its own cap spends none of the quota
+        if path == "/register" and method == "POST":
+            retry = lim.hit_global("register", rules.register_global)
             if retry:
                 return await _too_many(send, retry)
 
@@ -202,7 +250,7 @@ class Guard:
                     raise _TooLarge()
             return message
 
-        if path == "/token" and method == "POST":
+        if is_token:
             body = b""
             while True:
                 message = await counted_receive()
@@ -211,9 +259,13 @@ class Guard:
                     break
             form = urllib.parse.parse_qs(body.decode("latin-1"))
             client_id = (form.get("client_id") or [_basic_client_id(headers.get(b"authorization", b""))])[0][:64]
-            # the per-client bucket is recorded only after the per-IP and global caps passed, so junk client ids
-            # cannot fill the map faster than those caps allow
-            retry = lim.hit_global("token", rules.token_global) or lim.hit(f"token:{client_id}", rules.token_client)
+            if self._approved(client_id):
+                # an approved client has its own bucket and is never counted against the anonymous or global caps
+                retry = lim.hit_client(f"token:{client_id}", rules.token_client)
+            else:
+                # unknown, pending or junk client ids are anonymous traffic: per network, then the global cap
+                retry = (lim.hit(f"ip:{net}", rules.per_ip) or lim.hit(f"token-anon:{net}", rules.token_client)
+                         or lim.hit_global("token", rules.token_global))
             if retry:
                 return await _too_many(send, retry)
             resource = (form.get("resource") or [None])[0]
@@ -257,10 +309,10 @@ class ClientRateLimit:
         if scope["type"] == "http" and scope.get("path") == "/mcp":
             user = scope.get("user")
             if isinstance(user, AuthenticatedUser):
-                retry = self.limiter.hit(f"mcp:{user.access_token.client_id}", self.rule)
+                retry = self.limiter.hit_client(f"mcp:{user.access_token.client_id}", self.rule)
             else:
                 ip = (scope.get("client") or ("unknown",))[0]
-                retry = self.limiter.hit(f"mcp-anon:{ip}", self.anonymous_rule)
+                retry = self.limiter.hit(f"mcp-anon:{ip_bucket(ip)}", self.anonymous_rule)
             if retry:
                 return await _too_many(send, retry)
         await self.app(scope, receive, send)
