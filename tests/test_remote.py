@@ -705,18 +705,49 @@ def test_basic_auth_client_id_is_parsed_for_rate_limits():
     assert _basic_client_id(b"Bearer x") == "" and _basic_client_id(b"Basic !!!") == ""
 
 
-def test_rate_limiter_evicts_idle_buckets_and_caps_keys(monkeypatch):
+def test_rate_limiter_reclaims_idle_buckets_only(monkeypatch):
     now = [0.0]
     limiter = RateLimiter(clock=lambda: now[0])
+    monkeypatch.setattr(RateLimiter, "SWEEP_EVERY", 10)
     for i in range(100):
         limiter.hit(f"k{i}", (5, 60))
+    limiter.hit("slow", (5, 3600))
     now[0] = 61
-    limiter.hit("fresh", (5, 60))
-    assert list(limiter.hits) == ["fresh"]  # everything idle for over a window is gone
-    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 10)
-    for i in range(50):
-        limiter.hit(f"live{i}", (5, 60))
-    assert len(limiter.hits) == 10 and "live49" in limiter.hits
+    for i in range(10):
+        limiter.hit(f"fresh{i}", (5, 60))
+    assert set(limiter.hits) == {"slow"} | {f"fresh{i}" for i in range(10)}  # idle reclaimed, live "slow" kept
+
+
+def test_key_flood_cannot_reset_caps(monkeypatch):
+    now = [0.0]
+    limiter = RateLimiter(clock=lambda: now[0])
+    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 50)
+    global_rule, per_key = (5, 3600), (3, 60)
+    assert all(limiter.hit_global("register", global_rule) is None for _ in range(5))
+    assert limiter.hit_global("register", global_rule)  # cap reached
+    for _ in range(3):
+        assert limiter.hit("victim", per_key) is None
+    assert limiter.hit("victim", per_key)  # live bucket at its limit
+    # 10x MAX_KEYS distinct keys (rotating addresses or client ids)
+    results = [limiter.hit(f"junk{i}", per_key) for i in range(500)]
+    assert len(limiter.hits) <= 50
+    assert sum(r is None for r in results) <= 49 + RateLimiter.OVERFLOW_RULE[0]  # extra keys share the overflow cap
+    assert limiter.hit_global("register", global_rule)  # the global cap still holds
+    assert limiter.hit("victim", per_key)  # and the live per-key bucket survived the flood
+    now[0] = 61
+    assert limiter.hit("newcomer", per_key) is None  # once idle, junk buckets are reclaimed and room returns
+
+
+def test_junk_client_ids_do_not_reset_the_token_cap(tmp_path, plaid):
+    limits = Limits(per_ip=(10_000, 60), token_global=(5, 60), token_client=(100, 60))
+    app, provider, _ = make(tmp_path, limits=limits)
+    with TestClient(app, base_url=PUBLIC) as c:
+        codes = [c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x",
+                                         "client_id": f"junk-{i}"}).status_code for i in range(20)]
+        assert codes[:5].count(429) == 0 and set(codes[5:]) == {429}
+        limiter = c.app.limiter
+        assert not [k for k in limiter.hits if k.startswith("token:junk") and int(k.split("-")[1]) >= 5]
+    provider.close()
 
 
 def test_missing_forwarded_address_is_warned_once(tmp_path, plaid, caplog):

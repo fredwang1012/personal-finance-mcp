@@ -34,6 +34,7 @@ import base64
 import hashlib
 import hmac
 import html
+import itertools
 import json
 import secrets as pysecrets
 import sqlite3
@@ -293,6 +294,7 @@ class OwnerOAuthProvider:
         self._codes: dict[str, dict] = {}     # code digest -> authorization code
         self._used_codes: dict[str, dict] = {}  # code digest -> token family it issued (replay detection)
         self._holds: dict[str, dict] = {}     # hold id -> owner login parked until the client is approved
+        self._seq = itertools.count()          # arrival order, for evicting the oldest when times tie
 
     # --- helpers ------------------------------------------------------------------------------------------------
 
@@ -310,10 +312,10 @@ class OwnerOAuthProvider:
     def _trim(table: dict, match, keep: int, protect_approved: bool) -> None:
         """Drop the oldest entries matching `match` until `keep` remain; approved-client logins are spared when
         `protect_approved`, so nobody else's traffic can push them out."""
-        victims = sorted((v["created"], k) for k, v in table.items()
+        victims = sorted((v["created"], v["seq"], k) for k, v in table.items()
                          if match(v) and not (protect_approved and v["approved"]))
         excess = sum(1 for v in table.values() if match(v)) - keep
-        for _, key in victims[:max(0, excess)]:
+        for *_, key in victims[:max(0, excess)]:
             del table[key]
 
     def _redirect_error(self, pending: dict, error: str) -> RedirectResponse:
@@ -389,7 +391,7 @@ class OwnerOAuthProvider:
             if len(self._pending) >= MAX_PENDING:  # only approved-client logins left; drop the oldest of those
                 self._trim(self._pending, lambda v: True, MAX_PENDING - 1, False)
             self._pending[state] = {
-                "ip": ip, "approved": approved, "created": now,
+                "ip": ip, "approved": approved, "created": now, "seq": next(self._seq),
                 "client_id": client.client_id, "client_name": client.client_name or "",
                 "redirect_uri": str(params.redirect_uri), "explicit": params.redirect_uri_provided_explicitly,
                 "state": params.state, "code_challenge": params.code_challenge,
@@ -435,7 +437,7 @@ class OwnerOAuthProvider:
                 with self._lock:
                     self._expire(self._holds, self.clock())
                     self._trim(self._holds, lambda v: True, MAX_HOLDS - 1, False)
-                    self._holds[hold_id] = {**entry, "created": self.clock(),
+                    self._holds[hold_id] = {**entry, "created": self.clock(), "seq": next(self._seq),
                                             "expires_at": client_row[1] + PENDING_CLIENT_TTL}
                 self.audit.event("login_pending_client", client=entry["client_id"])
                 # a redirect, so that reloading the page does not replay the one-time GitHub callback

@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import urllib.parse
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -56,37 +56,54 @@ class Limits:
 
 
 class RateLimiter:
-    """Sliding-window counter in memory. Restarting the service resets it, which is acceptable for one owner.
+    """Sliding-window counters in memory. Restarting the service resets them, which is acceptable for one owner.
 
-    Buckets idle for longer than their window are dropped, and the number of keys is capped (least recently used
-    goes first), so a flood of distinct keys cannot grow memory without bound."""
+    - Global buckets (`hit_global`: total registrations, total token requests) live in their own small map that is
+      never evicted, so no flood of other keys can reset them.
+    - Per-key buckets (per IP, per client) are reclaimed only once idle for longer than their window; a live bucket
+      is never dropped. When the per-key map is full, requests with a new key share one strict overflow bucket
+      instead, so rotating keys (spoofed addresses, junk client ids) buys nothing.
+    """
 
     MAX_KEYS = 10000
+    OVERFLOW_RULE = (30, 60)
+    SWEEP_EVERY = 1000
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
-        self.hits: OrderedDict[str, tuple[deque, int]] = OrderedDict()  # key -> (timestamps, window)
+        self.hits: dict[str, tuple[deque, int]] = {}          # per-key: key -> (timestamps, window)
+        self.global_hits: dict[str, tuple[deque, int]] = {}   # never evicted
+        self._since_sweep = 0
 
-    def _evict(self, now: float) -> None:
-        while self.hits:
-            key, (q, window) = next(iter(self.hits.items()))
-            if q and q[-1] > now - window and len(self.hits) <= self.MAX_KEYS:
-                break  # the least recently used bucket is still live, so all later ones are too
+    def _sweep(self, now: float) -> None:
+        for key in [k for k, (q, window) in self.hits.items() if not q or q[-1] <= now - window]:
             del self.hits[key]
+        self._since_sweep = 0
 
-    def hit(self, key: str, rule: tuple[int, int]) -> int | None:
-        """Record a request; return seconds to wait if over the limit, else None."""
+    @staticmethod
+    def _count(table: dict, key: str, rule: tuple[int, int], now: float) -> int | None:
         limit, window = rule
-        now = self.clock()
-        q, _ = self.hits.pop(key, (deque(), window))
-        self.hits[key] = (q, window)  # most recently used goes last
+        q, _ = table.setdefault(key, (deque(), window))
         while q and q[0] <= now - window:
             q.popleft()
         if len(q) >= limit:
             return max(1, int(q[0] + window - now) + 1)
         q.append(now)
-        self._evict(now)
         return None
+
+    def hit_global(self, key: str, rule: tuple[int, int]) -> int | None:
+        """A cap over all clients together; return seconds to wait if over the limit, else None."""
+        return self._count(self.global_hits, key, rule, self.clock())
+
+    def hit(self, key: str, rule: tuple[int, int]) -> int | None:
+        """A per-key cap; return seconds to wait if over the limit, else None."""
+        now = self.clock()
+        self._since_sweep += 1
+        if key not in self.hits and (len(self.hits) >= self.MAX_KEYS or self._since_sweep >= self.SWEEP_EVERY):
+            self._sweep(now)
+        if key not in self.hits and len(self.hits) >= self.MAX_KEYS:
+            return self._count(self.global_hits, "overflow", self.OVERFLOW_RULE, now)
+        return self._count(self.hits, key, rule, now)
 
 
 async def _send_json(send, status: int, body: dict, headers: list | None = None) -> None:
@@ -163,13 +180,14 @@ class Guard:
         lim, rules = self.limiter, self.limits
         # /mcp is limited after authentication instead (ClientRateLimit), so strangers sharing the owner's
         # address cannot use up the owner's quota
-        checks = [] if path == "/mcp" else [(f"ip:{ip}", rules.per_ip)]
+        # each entry: (key, rule, is_global); global caps are counted before the per-key ones behind them
+        checks = [] if path == "/mcp" else [(f"ip:{ip}", rules.per_ip, False)]
         if path == "/register" and method == "POST":
-            checks += [(f"register:{ip}", rules.register_ip), ("register", rules.register_global)]
+            checks += [("register", rules.register_global, True), (f"register:{ip}", rules.register_ip, False)]
         elif path == "/authorize" or path.startswith("/oauth/"):
-            checks.append((f"login:{ip}", rules.login_ip))
-        for key, rule in checks:
-            retry = lim.hit(key, rule)
+            checks.append((f"login:{ip}", rules.login_ip, False))
+        for key, rule, is_global in checks:
+            retry = lim.hit_global(key, rule) if is_global else lim.hit(key, rule)
             if retry:
                 return await _too_many(send, retry)
 
@@ -193,10 +211,11 @@ class Guard:
                     break
             form = urllib.parse.parse_qs(body.decode("latin-1"))
             client_id = (form.get("client_id") or [_basic_client_id(headers.get(b"authorization", b""))])[0][:64]
-            for key, rule in ((f"token:{client_id}", rules.token_client), ("token", rules.token_global)):
-                retry = lim.hit(key, rule)
-                if retry:
-                    return await _too_many(send, retry)
+            # the per-client bucket is recorded only after the per-IP and global caps passed, so junk client ids
+            # cannot fill the map faster than those caps allow
+            retry = lim.hit_global("token", rules.token_global) or lim.hit(f"token:{client_id}", rules.token_client)
+            if retry:
+                return await _too_many(send, retry)
             resource = (form.get("resource") or [None])[0]
             if resource is not None and canonical(resource) != canonical(self.resource):
                 return await _send_json(send, 400, {"error": "invalid_target",
