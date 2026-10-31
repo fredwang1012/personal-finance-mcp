@@ -165,6 +165,18 @@ claude mcp add personal-finance -- py -3.12 -m uv run --directory C:\dev\UofT\Pr
 Add `-s user` before `personal-finance` to make it available in every project rather than just the current one. In
 Git Bash, quote the path or use forward slashes. `claude mcp list` shows whether it connected.
 
+## Use from claude.ai and the Claude apps
+
+To use the same tools in Claude on the web, iPhone and iPad, run them on a small server:
+- `python -m app.cli serve-http` serves the tools over MCP Streamable HTTP on 127.0.0.1.
+- Tailscale Funnel makes it reachable at a public HTTPS URL.
+- OAuth sign-in admits only your GitHub account.
+- Each client Claude registers is approved once on the server.
+
+Add the connector once at claude.ai and it shows up in the iOS and iPadOS apps. The existing Production access token
+is moved from the keychain into encrypted systemd credentials without relinking, so no Trial slot is used. Every step
+is in [docs/REMOTE.md](docs/REMOTE.md), from the Oracle VM to revoking everything.
+
 ## Security model
 
 - **Read-only.** Plaid Link asks only for the `investments` product, plus `transactions` where the institution
@@ -181,7 +193,10 @@ Git Bash, quote the path or use forward slashes. `claude mcp list` shows whether
   and then exits, or exits after 10 minutes. The page has a CSP that only allows Plaid. In update mode
   (`link --update`) there is no token exchange: the page reports success once, with the same state token and checks,
   and nothing is stored.
-- **Local only.** The server speaks stdio to the Claude app on this machine. It opens no port.
+- **Local only by default.** The stdio server speaks to the Claude app on this machine and opens no port. The optional
+  remote connector (`serve-http`) listens on 127.0.0.1 behind Tailscale Funnel. Every request needs an OAuth token
+  that is bound to its URL and issued only after your GitHub login and your approval on the server. See
+  [docs/REMOTE.md](docs/REMOTE.md).
 - **Field minimisation.** Whatever a tool returns becomes model context, so tools return only what a question needs:
   accounts are referred to by an 8-character hash, never a Plaid id; masks are the last 4 characters; free text
   (account names, descriptions, institution names) has control characters stripped, long digit runs masked, anything
@@ -236,8 +251,7 @@ are comfortable with that for the fields above.
 
 ## Roadmap
 
-- **Remote connector (next).** The same tools for Claude on the web, iPhone and iPad, served from my own VM over
-  Tailscale Funnel with OAuth restricted to my GitHub account. Phase 1 is local stdio only.
+- **Remote connector:** built, see [docs/REMOTE.md](docs/REMOTE.md). Not yet deployed.
 - Savings rate and budgeting, once bank transactions are in.
 
 ## Tests
