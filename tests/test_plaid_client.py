@@ -50,8 +50,7 @@ def test_link_token_request_shape():
     assert real.create_link_token() == "link-abc"
     req = captured["req"]
     assert [str(p.value) for p in req.products] == ["investments"]
-    assert [str(p.value) for p in req.required_if_supported_products] == ["transactions"]
-    assert not {"optional_products", "additional_consented_products", "access_token"} & set(req.to_dict())
+    assert not {"required_if_supported_products", "optional_products", "additional_consented_products", "access_token"} & set(req.to_dict())
     assert [str(c.value) for c in req.country_codes] == ["CA"]
     assert req.language == "en"
     assert req.client_name == "personal-finance-mcp"
@@ -77,9 +76,11 @@ def test_every_call_has_a_request_timeout():
     assert 0 < plaid_client.REQUEST_TIMEOUT <= 30
 
 
-def test_only_investments_and_transactions_are_ever_requested():
+def test_only_investments_is_ever_requested():
     assert plaid_client.PRODUCTS == ["investments"]
-    assert plaid_client.REQUIRED_IF_SUPPORTED_PRODUCTS == ["transactions"]
+    assert not hasattr(plaid_client, "REQUIRED_IF_SUPPORTED_PRODUCTS")
+    assert not hasattr(plaid_client.RealPlaid, "transactions_sync")
+    assert "transactions_sync" not in plaid_client.PlaidAPI.__dict__
 
 
 def test_update_mode_link_token_sends_access_token_and_no_products():

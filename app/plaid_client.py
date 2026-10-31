@@ -1,4 +1,4 @@
-"""Thin read-only wrapper over plaid-python. Only investments and transactions are ever requested, and no
+"""Thin read-only wrapper over plaid-python. Only the investments product is ever requested, and no
 money-movement endpoint is wrapped. Methods return plain dicts so callers and test fakes share one shape."""
 import json
 import re
@@ -18,15 +18,13 @@ from plaid.model.item_remove_request import ItemRemoveRequest
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
 from plaid.model.products import Products
-from plaid.model.transactions_sync_request import TransactionsSyncRequest
 
 from app import secrets
 from app.redact import clean_text
 
-# Investments is required; transactions is used only where the institution supports it, so an institution without
-# Transactions still links. These two are the only products ever requested.
+# The only product ever requested. Transactions is not asked for: nothing reads it, and consenting to it would let a
+# stolen access token read cash and chequing activity too.
 PRODUCTS = ["investments"]
-REQUIRED_IF_SUPPORTED_PRODUCTS = ["transactions"]
 CLIENT_NAME = "personal-finance-mcp"
 TOKEN_SHAPE = re.compile(r"(?:access|link|public)-[a-z]+-[\w-]+")
 LOCAL_USER_ID = "owner"
@@ -49,7 +47,6 @@ class PlaidAPI(Protocol):
     def accounts_get(self, access_token: str) -> dict[str, Any]: ...
     def investments_holdings_get(self, access_token: str) -> dict[str, Any]: ...
     def investments_transactions_get(self, access_token: str, start: date, end: date) -> dict[str, Any]: ...
-    def transactions_sync(self, access_token: str, cursor: str | None = None) -> dict[str, Any]: ...
     def item_get(self, access_token: str) -> dict[str, Any]: ...
     def item_remove(self, access_token: str) -> None: ...
 
@@ -97,10 +94,7 @@ class RealPlaid:
         if access_token:
             mode = {"access_token": access_token}
         else:
-            mode = {
-                "products": [Products(p) for p in PRODUCTS],
-                "required_if_supported_products": [Products(p) for p in REQUIRED_IF_SUPPORTED_PRODUCTS],
-            }
+            mode = {"products": [Products(p) for p in PRODUCTS]}
         request = LinkTokenCreateRequest(
             client_name=CLIENT_NAME,
             language="en",
@@ -150,12 +144,6 @@ class RealPlaid:
             fetched = len(result["investment_transactions"])
             if not page["investment_transactions"] or fetched >= page["total_investment_transactions"]:
                 return result
-
-    def transactions_sync(self, access_token: str, cursor: str | None = None) -> dict[str, Any]:
-        extra = {"cursor": cursor} if cursor else {}
-        return self._call(
-            self._api.transactions_sync, TransactionsSyncRequest(access_token=access_token, **extra)
-        ).to_dict()
 
     def item_get(self, access_token: str) -> dict[str, Any]:
         return self._call(self._api.item_get, ItemGetRequest(access_token=access_token)).to_dict()
