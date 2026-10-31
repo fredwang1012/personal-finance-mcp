@@ -88,3 +88,18 @@ def test_set_plaid_keys_reports_lengths_not_values(monkeypatch, capsys):
     assert "...e392 (24 characters)" in out and "secret has 30 characters" in out
     assert "0123456789abcdef" not in out
     assert secrets.get_plaid_secret(cli.settings.plaid_env) == "0123456789abcdef0123456789abcd"
+
+
+def test_pytest_never_sees_production_or_real_plaid(tmp_path):
+    from app import plaid_client, server
+    from app.config import ROOT, settings
+
+    assert settings.plaid_env == "sandbox"
+    assert settings.secrets_backend == "keyring"
+    assert settings.data_dir != ROOT / "data"
+    with pytest.raises(RuntimeError, match="fake"):
+        server.plaid_factory(settings)
+    with pytest.raises(RuntimeError):
+        plaid_client.RealPlaid.from_settings(settings)
+    with pytest.raises(RuntimeError):
+        plaid_client.RealPlaid("production", ["CA"], client_id="c", secret="s")
