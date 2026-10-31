@@ -159,28 +159,42 @@ sudo deploy/import-credential.sh token_signing_key --generate    # 32 random byt
 ```
 
 **Plaid keys and the existing production access token: move them, do not relink.** Relinking would use another of
-the 10 Production Trial slots. Instead, pipe the keychain contents from the laptop straight into encrypted
-credentials on the VM. The data travels inside the SSH connection, never lands in a file on either machine, and is
-never shown on screen. `export-bundle` refuses to write to a terminal.
+the 10 Production Trial slots. Instead, seal the keychain contents on the laptop to a one-time key made on the VM.
+Only ciphertext ever leaves the laptop, so it does not matter where it is shown, piped or pasted. The cipher is
+X25519 with HKDF-SHA256 and AES-256-GCM, from the `cryptography` package that is already locked.
 
-On the laptop, in **Git Bash** in the repo, with `PLAID_ENV=production` in `.env`:
+1. On the VM, make the one-time key. Its private half is stored as an encrypted credential; only the public half is
+   printed:
 
-```bash
-py -3.12 -m uv run python -m app.cli status        # expect: plaid_env production, linked items: 1
-py -3.12 -m uv run python -m app.cli export-bundle | ssh ubuntu@<public-ip> "sudo pfmcp import-bundle"
-```
+   ```bash
+   sudo pfmcp bundle-key
+   # Public key for export-bundle --to ...:
+   # pfmcp-pub-1:3vQ...            <- copy this line
+   ```
 
-Use Git Bash rather than PowerShell for this pipe. It relies on the default `ubuntu` (or `opc`) user having
-passwordless sudo, as on Oracle's images, because the pipe leaves no terminal for a password prompt. Both sides print the item's short id, so you can check they match.
-Then on the VM:
+2. On the laptop, in the repo, with `PLAID_ENV=production` in `.env`, seal and send the bundle. `export-bundle`
+   refuses to run without `--to`. Git Bash or PowerShell both work:
 
-```bash
-sudo pfmcp status                                   # plaid_env production, keys stored yes, linked items: 1
-sudo ls -l /etc/credstore.encrypted/personal-finance-mcp/   # five files, root-only, encrypted
-```
+   ```bash
+   py -3.12 -m uv run python -m app.cli status        # expect: plaid_env production, linked items: 1
+   py -3.12 -m uv run python -m app.cli export-bundle --to pfmcp-pub-1:3vQ... | ssh ubuntu@<public-ip> "sudo pfmcp import-bundle"
+   ```
 
-`import-bundle` writes `plaid_client_id`, `plaid_secret_production` and `plaid_items_production` with
-`systemd-creds encrypt`.
+   The pipe relies on the default `ubuntu` (or `opc`) user having passwordless sudo, as on Oracle's images. Without
+   it, run `export-bundle --to ...` alone, copy the single `pfmcp-sealed-1:...` line it prints, then run
+   `sudo pfmcp import-bundle` in an SSH session and paste the line. Both sides print the item's short id, so you can
+   check they match.
+
+3. Check on the VM:
+
+   ```bash
+   sudo pfmcp status                                   # plaid_env production, keys stored yes, linked items: 1
+   sudo ls -l /etc/credstore.encrypted/personal-finance-mcp/   # five files, root-only, encrypted
+   ```
+
+`import-bundle` decrypts with the one-time key. It writes `plaid_client_id`, `plaid_secret_production` and
+`plaid_items_production` with `systemd-creds encrypt`, then deletes the one-time key, so a stray copy of the
+ciphertext is useless afterwards. If the key is lost or the import fails, run `bundle-key` again and re-export.
 
 The laptop keeps its copy, so the local stdio server still works. Both copies are the same Plaid item, and
 `unlink` on either machine revokes it for both.
@@ -190,7 +204,11 @@ The laptop keeps its copy, so the local stdio server still works. Both copies ar
 ```bash
 ssh -L 8766:127.0.0.1:8766 ubuntu@<public-ip>
 sudo pfmcp link --port 8766        # open the printed http://127.0.0.1:8766/... URL in the laptop's browser
+sudo systemctl restart personal-finance-mcp   # the service reads credentials only when it starts
 ```
+
+Restart the service after any change to the credentials: `import-bundle`, `link`, `unlink` or
+`import-credential.sh`.
 
 ## 7. Start and check
 
@@ -207,6 +225,17 @@ If the service fails to start with a `MemoryDenyWriteExecute` or `SystemCallFilt
 out that one line in `/etc/systemd/system/personal-finance-mcp.service`, run `sudo systemctl daemon-reload`, and
 restart. Keep the other sandbox lines.
 
+**Check that real client addresses arrive.** Per-IP limits need the client's address, which Funnel should pass in
+`X-Forwarded-For`. uvicorn trusts that header from 127.0.0.1 only. After the first requests from outside (the `curl`
+lines above, run from the laptop), look for this warning:
+
+```bash
+journalctl -u personal-finance-mcp | grep "forwarded client address"
+```
+
+If the warning is there, Funnel did not send the address. Every request then shares one per-IP bucket. That still
+works for one owner: a stranger's sign-ins cannot push out yours, and `/mcp` calls are limited per OAuth client.
+
 ## 8. Add the connector in Claude, with the one-time approval
 
 1. In claude.ai, open **Customize → Connectors** (in older layouts, **Settings → Connectors**) → **Add custom
@@ -216,8 +245,8 @@ restart. Keep the other sandbox lines.
    - Leave the OAuth client ID and secret empty. If asked how Claude identifies itself, choose **Register
      automatically** (Dynamic Client Registration).
 2. Click **Connect**. Sign in to GitHub and authorize the OAuth App.
-3. The first time, you land on **New connection needs approval**. It shows the time the client registered and an
-   8-character **fingerprint**. Nothing has been issued yet. On the VM:
+3. The first time, you land on **New connection needs approval** at `/oauth/pending`. It shows the time the client
+   registered and an 8-character **fingerprint**. Nothing has been issued yet. Keep that browser tab open. On the VM:
 
    ```bash
    sudo pfmcp list-clients                 # the new client: status pending, registered just now
@@ -227,14 +256,21 @@ restart. Keep the other sandbox lines.
    Only approve if you just clicked Connect in your own claude.ai. Someone else can register a client by adding your
    URL to their claude.ai account and sending you the sign-in link. The approval step stops their Claude from getting
    your data. Pending requests expire after 30 minutes.
-4. Click **Connect** in Claude again. GitHub may skip its prompt this time. The consent page names the client and
-   shows its fingerprint and registration time. Click **Allow**.
+4. **Reload the approval page** in the same browser. It now shows the consent page: the client's name, fingerprint
+   and registration time, and a reminder to continue only if you just clicked Connect yourself. Click **Allow**, and
+   the browser goes back to claude.ai with the connection made.
+
+   This works whether or not Claude would reuse its registration. The waiting sign-in is tied to that browser by a
+   cookie, so nobody else can complete it. If the tab was closed, click **Connect** in Claude again instead. If
+   Claude registers a new client then, approve the new fingerprint too.
 5. The connector appears in the Claude apps on iPhone and iPad signed in to the same account, with nothing to set up
    there. In a chat, turn it on from the **+** menu → **Connectors**. Under **Customize → Connectors** you can mark
    the tools **Always allow** or keep approving each call.
 
 Claude registers a new client whenever the connector is added again. Approve each one the same way, and revoke old
-ones with `sudo pfmcp revoke-client <fingerprint>`.
+ones with `sudo pfmcp revoke-client <fingerprint>`. Approved and revoked clients count toward a cap of 50
+(`list-clients` shows how many are used), and only revoking makes room. Pending ones expire after 30 minutes, and
+at most 20 wait at once, the oldest giving way.
 
 ## Operating it
 
@@ -245,12 +281,18 @@ ones with `sudo pfmcp revoke-client <fingerprint>`.
 - **Tokens:**
   - Access tokens last 1 hour.
   - Refresh tokens rotate on every use and last 30 days, and you sign in again after 90 days at most.
-  - Reusing an old refresh token revokes that whole login.
+  - Reusing an old refresh token, or two uses racing, revokes that whole login.
+  - A code works once. Replaying it revokes the tokens it issued, and a wrong PKCE verifier destroys it.
   - Codes and tokens are stored only as HMAC digests keyed by the signing key.
 - **Limits:**
   - Request bodies are capped at 64 KiB.
-  - Rate limits: 10 registrations per IP per hour (30 a day in total), 30 token requests per client per minute,
-    120 MCP requests per client per minute, and 300 requests per IP per minute overall. Over the limit gives 429.
+  - Rate limits (over the limit gives 429):
+    - 10 registrations per IP per hour, 200 a day in total;
+    - 30 token requests per client per minute;
+    - 120 MCP requests per OAuth client per minute, and 60 per IP per minute for requests without a valid token;
+    - 300 other requests per IP per minute.
+  - Sign-ins in progress are capped at 2 per client, 5 per IP and 50 in total. A stranger's sign-ins never push out
+    one for an approved client.
 - **Errors:** clients see only a short error code, never a traceback. The access log is off because query strings
   carry OAuth state and GitHub codes.
 
@@ -259,14 +301,18 @@ ones with `sudo pfmcp revoke-client <fingerprint>`.
 Do as many of these as the situation needs. Each one alone cuts Claude off.
 
 1. **Remove the connector:** claude.ai → **Customize → Connectors** → the connector → **Remove**.
-2. **Revoke its OAuth client and tokens:** `sudo pfmcp list-clients`, then `sudo pfmcp revoke-client <fingerprint>`.
-3. **Rotate the signing key.** This invalidates every token and client at once:
+2. **Revoke the OAuth clients and their tokens:** `sudo pfmcp revoke-client <fingerprint>` for one, or
+   `sudo pfmcp revoke-client --all` for every client. To start from nothing, stop the service and delete
+   `/var/lib/personal-finance-mcp/oauth.db`.
+3. **Rotate the signing key.** This invalidates every token and every confidential client's secret at once:
 
    ```bash
    sudo /opt/personal-finance-mcp/deploy/import-credential.sh token_signing_key --generate
    sudo systemctl restart personal-finance-mcp
    ```
 
+   It does **not** undo the approval of public clients, and Claude registers as a public client. An approved Claude
+   client could sign in again, though only through your GitHub login. So pair the rotation with step 2.
 4. **Rotate the GitHub secret:**
    1. On GitHub, open the OAuth App and click **Generate a new client secret**.
    2. Run `sudo /opt/personal-finance-mcp/deploy/import-credential.sh github_client_secret` and restart the service.
@@ -274,8 +320,9 @@ Do as many of these as the situation needs. Each one alone cuts Claude off.
 
    To shut the door completely, delete the OAuth App instead.
 5. **Revoke the Plaid item.** `sudo pfmcp unlink` lists the items. `sudo pfmcp unlink <short-id>` calls Plaid
-   `item_remove`, which kills the token on the laptop too, and deletes it from the credentials. Then check the Plaid
-   dashboard and [my.plaid.com](https://my.plaid.com). On the Trial plan the slot stays used.
+   `item_remove`, which kills the token on the laptop too, and deletes it from the credentials. Then restart the
+   service and check the Plaid dashboard and [my.plaid.com](https://my.plaid.com). On the Trial plan the slot stays
+   used.
 6. **Stop public access:**
 
    ```bash

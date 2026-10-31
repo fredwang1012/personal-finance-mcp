@@ -34,13 +34,35 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 
 echo "== uv $UV_VERSION"
+# The release tarball is checked against its published SHA-256 file instead of piping an installer into sh.
+# For a stronger pin, put the hash you verified once in UV_SHA256 below and it is checked instead.
+UV_SHA256="${UV_SHA256:-}"
 if ! command -v uv >/dev/null || [[ "$(uv --version | awk '{print $2}')" != "$UV_VERSION" ]]; then
-    curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    case "$(uname -m)" in
+        x86_64) triple=x86_64-unknown-linux-gnu ;;
+        aarch64) triple=aarch64-unknown-linux-gnu ;;
+        *) echo "unsupported CPU $(uname -m)" >&2; exit 1 ;;
+    esac
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    base="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$triple.tar.gz"
+    curl -fLsS -o "$tmp/uv.tar.gz" "$base"
+    if [[ -n "$UV_SHA256" ]]; then
+        echo "$UV_SHA256  $tmp/uv.tar.gz" | sha256sum -c -
+    else
+        curl -fLsS -o "$tmp/uv.tar.gz.sha256" "$base.sha256"
+        echo "$(awk '{print $1}' "$tmp/uv.tar.gz.sha256")  $tmp/uv.tar.gz" | sha256sum -c -
+    fi
+    tar -xzf "$tmp/uv.tar.gz" -C "$tmp"
+    install -m 0755 "$tmp/uv-$triple/uv" "$tmp/uv-$triple/uvx" /usr/local/bin/
+    rm -rf "$tmp"
+    trap - EXIT
 fi
 
 echo "== dependencies (locked)"
 cd "$APP"
-UV_PROJECT_ENVIRONMENT="$APP/.venv" uv sync --frozen --no-dev --python python3.12
+# only-system: use the distribution's python3.12, never a downloaded interpreter
+UV_PYTHON_PREFERENCE=only-system UV_PROJECT_ENVIRONMENT="$APP/.venv" uv sync --frozen --no-dev --python python3.12
 chown -R root:root "$APP"
 chmod -R go-w "$APP"
 
