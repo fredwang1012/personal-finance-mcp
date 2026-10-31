@@ -1,0 +1,20 @@
+[project]
+name = "personal-finance-mcp"
+version = "0.1.0"
+description = "Local read-only MCP server for Wealthsimple data via Plaid, with a CSV fallback"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mcp>=2.3",
+    "plaid-python>=46.0",
+    "keyring>=25.7",
+    "pydantic-settings>=2.16",
+]
+
+[dependency-groups]
+dev = ["pytest>=9"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
