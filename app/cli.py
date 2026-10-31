@@ -28,13 +28,25 @@ def status() -> int:
     return 0
 
 
+def link() -> int:
+    from app.link import run_link
+    from app.plaid_client import PlaidError, RealPlaid
+
+    try:
+        return run_link(RealPlaid.from_settings(settings), settings.plaid_env)
+    except (secrets.MissingSecret, PlaidError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("set-plaid-keys", help="prompt for Plaid client_id and secret and store them in the keychain")
     sub.add_parser("status", help="show environment, whether keys exist, and linked item count")
+    sub.add_parser("link", help="open Plaid Link in your browser to link Wealthsimple")
     args = parser.parse_args(argv)
-    return set_plaid_keys() if args.command == "set-plaid-keys" else status()
+    return {"set-plaid-keys": set_plaid_keys, "status": status, "link": link}[args.command]()
 
 
 if __name__ == "__main__":
