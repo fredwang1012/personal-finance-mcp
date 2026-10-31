@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from types import SimpleNamespace
 
 import plaid
@@ -48,7 +49,9 @@ def test_link_token_request_shape():
     real._api = SimpleNamespace(link_token_create=fake_create)
     assert real.create_link_token() == "link-abc"
     req = captured["req"]
-    assert [str(p.value) for p in req.products] == ["investments", "transactions"]
+    assert [str(p.value) for p in req.products] == ["investments"]
+    assert [str(p.value) for p in req.required_if_supported_products] == ["transactions"]
+    assert not {"optional_products", "additional_consented_products", "access_token"} & set(req.to_dict())
     assert [str(c.value) for c in req.country_codes] == ["CA"]
     assert req.language == "en"
     assert req.client_name == "personal-finance-mcp"
@@ -72,3 +75,45 @@ def test_every_call_has_a_request_timeout():
     real._call(spy, object())
     assert seen == {"_request_timeout": plaid_client.REQUEST_TIMEOUT}
     assert 0 < plaid_client.REQUEST_TIMEOUT <= 30
+
+
+def test_only_investments_and_transactions_are_ever_requested():
+    assert plaid_client.PRODUCTS == ["investments"]
+    assert plaid_client.REQUIRED_IF_SUPPORTED_PRODUCTS == ["transactions"]
+
+
+def test_update_mode_link_token_sends_access_token_and_no_products():
+    real = make_real()
+    captured = {}
+
+    def fake_create(request, **_kwargs):
+        captured["req"] = request
+        return {"link_token": "link-update"}
+
+    real._api = SimpleNamespace(link_token_create=fake_create)
+    assert real.create_link_token("access-sandbox-existing") == "link-update"
+    sent = captured["req"].to_dict()
+    assert sent["access_token"] == "access-sandbox-existing"
+    assert not {"products", "required_if_supported_products", "optional_products"} & set(sent)
+    assert sent["user"] == {"client_user_id": "owner"} and sent["client_name"] == "personal-finance-mcp"
+
+
+def test_investment_transactions_pages_merge_and_dedupe_securities():
+    real = make_real()
+    pages = [
+        {"investment_transactions": [{"n": 1}, {"n": 2}], "total_investment_transactions": 3,
+         "securities": [{"security_id": "a"}, {"security_id": "b"}]},
+        {"investment_transactions": [{"n": 3}], "total_investment_transactions": 3,
+         "securities": [{"security_id": "b"}, {"security_id": "c"}]},
+    ]
+    offsets = []
+
+    def fake_get(request, **_kwargs):
+        offsets.append(request.options.offset)
+        return SimpleNamespace(to_dict=lambda page=pages[len(offsets) - 1]: page)
+
+    real._api = SimpleNamespace(investments_transactions_get=fake_get)
+    out = real.investments_transactions_get("tok", date(2024, 1, 1), date(2024, 2, 1))
+    assert offsets == [0, 2]
+    assert [t["n"] for t in out["investment_transactions"]] == [1, 2, 3]
+    assert [s["security_id"] for s in out["securities"]] == ["a", "b", "c"]

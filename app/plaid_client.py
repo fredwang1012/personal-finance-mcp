@@ -21,7 +21,10 @@ from plaid.model.transactions_sync_request import TransactionsSyncRequest
 
 from app import secrets
 
-PRODUCTS = ["investments", "transactions"]
+# Investments is required; transactions is used only where the institution supports it, so an institution without
+# Transactions still links. These two are the only products ever requested.
+PRODUCTS = ["investments"]
+REQUIRED_IF_SUPPORTED_PRODUCTS = ["transactions"]
 CLIENT_NAME = "personal-finance-mcp"
 LOCAL_USER_ID = "owner"
 _PAGE = 500
@@ -38,7 +41,7 @@ class PlaidError(Exception):
 
 
 class PlaidAPI(Protocol):
-    def create_link_token(self) -> str: ...
+    def create_link_token(self, access_token: str | None = None) -> str: ...  # access_token: update mode
     def exchange_public_token(self, public_token: str) -> tuple[str, str]: ...  # (access_token, item_id)
     def accounts_get(self, access_token: str) -> dict[str, Any]: ...
     def investments_holdings_get(self, access_token: str) -> dict[str, Any]: ...
@@ -82,13 +85,22 @@ class RealPlaid:
         except plaid.ApiException as exc:
             raise _translate(exc) from None  # `from None` drops the original, whose text can include the body
 
-    def create_link_token(self) -> str:
+    def create_link_token(self, access_token: str | None = None) -> str:
+        """A Link token for a new Item, or, given an existing Item's access_token, for update mode (re-authenticate
+        that Item). Update mode omits products, as Plaid requires, and creates no new Item."""
+        if access_token:
+            mode = {"access_token": access_token}
+        else:
+            mode = {
+                "products": [Products(p) for p in PRODUCTS],
+                "required_if_supported_products": [Products(p) for p in REQUIRED_IF_SUPPORTED_PRODUCTS],
+            }
         request = LinkTokenCreateRequest(
             client_name=CLIENT_NAME,
             language="en",
             country_codes=[CountryCode(c) for c in self._country_codes],
             user=LinkTokenCreateRequestUser(client_user_id=LOCAL_USER_ID),
-            products=[Products(p) for p in PRODUCTS],
+            **mode,
         )
         return self._call(self._api.link_token_create, request)["link_token"]
 
@@ -121,8 +133,14 @@ class RealPlaid:
             ).to_dict()
             if result is None:
                 result = page
+                result["securities"] = list(result.get("securities") or [])
+                seen = {s.get("security_id") for s in result["securities"]}
             else:
                 result["investment_transactions"].extend(page["investment_transactions"])
+                for security in page.get("securities") or []:
+                    if security.get("security_id") not in seen:
+                        seen.add(security.get("security_id"))
+                        result["securities"].append(security)
             fetched = len(result["investment_transactions"])
             if not page["investment_transactions"] or fetched >= page["total_investment_transactions"]:
                 return result

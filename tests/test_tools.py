@@ -1,12 +1,13 @@
 import asyncio
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from app import csvimport, secrets, server, store, tools
 from app.plaid_client import PlaidError
+from app.redact import short_hash
 
 FIX = Path(__file__).parent / "fixtures"
 TOKEN_OK, TOKEN_BAD = "access-sandbox-TOKENMARK-ok", "access-sandbox-TOKENMARK-bad"
@@ -60,10 +61,14 @@ class FakePlaid:
 
     def item_get(self, token):
         self._check(token)
+        # plaid-python's ItemGetResponse shape: status is top level, beside item, with datetime values
         return {"item": {"item_id": ITEM_OK, "institution_name": "Wealthsimple",
-                         "products": ["transactions", "investments"],
-                         "status": {"investments": {"last_successful_update": "2024-03-09T10:00:00Z"}},
-                         "error": None}, "request_id": "reqid-marker"}
+                         "products": ["transactions", "investments"], "error": None},
+                "status": {"investments": {"last_successful_update": datetime(2024, 3, 9, 10, tzinfo=timezone.utc),
+                                           "last_failed_update": None},
+                           "transactions": {"last_successful_update": datetime(2024, 3, 8, 9, tzinfo=timezone.utc)},
+                           "last_webhook": None},
+                "request_id": "reqid-marker"}
 
 
 @pytest.fixture
@@ -206,8 +211,35 @@ def test_only_failing_item_falls_back_to_csv(csv_conn):
 def test_item_health_shape(backend):
     item = tools.item_health(backend)["items"][0]
     assert item == {"id": item["id"], "institution": "Wealthsimple", "products": ["investments", "transactions"],
-                    "last_successful_update": "2024-03-09T10:00:00Z", "error_code": None}
+                    "last_successful_update": "2024-03-09T10:00:00+00:00", "error_code": None}
     assert len(item["id"]) == 8
+
+
+def test_item_health_reads_top_level_status_not_item_status(csv_conn):
+    class NestedStatus(FakePlaid):
+        def item_get(self, token):
+            r = super().item_get(token)
+            r["item"]["status"] = r.pop("status")  # the old, wrong place
+            return r
+
+    b = tools.Backend(csv_conn, NestedStatus(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    assert tools.item_health(b)["items"][0]["last_successful_update"] is None
+
+
+def test_login_required_points_to_update_mode(csv_conn):
+    class LoginRequired(FakePlaid):
+        def item_get(self, token):
+            r = super().item_get(token)
+            r["item"]["error"] = {"error_code": "ITEM_LOGIN_REQUIRED"}
+            return r
+
+    short = short_hash(ITEM_OK)
+    b = tools.Backend(csv_conn, LoginRequired(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    notes = tools.item_health(b)["notes"]
+    assert any(f"{tools.LINK_CMD} --update {short}" in n and "Trial slot" in n for n in notes)
+    b = tools.Backend(csv_conn, FakePlaid(), {ITEM_BAD: TOKEN_BAD}, today=lambda: TODAY)
+    notes = tools.get_holdings(b)["notes"]
+    assert any(f"--update {short_hash(ITEM_BAD)}" in n and "Trial slot" in n for n in notes)
 
 
 def test_no_secrets_or_ids_in_any_output(csv_conn):

@@ -83,6 +83,20 @@ that the Item permanently takes one of the 10 Trial slots and asks you to type `
 Link and sign in there. Your Wealthsimple password and 2FA go only to Plaid inside Plaid Link; this code never sees
 them.
 
+### 5. Reconnect an item (ITEM_LOGIN_REQUIRED)
+
+When Plaid needs you to sign in again (a password change, an expired session), the tools report
+`ITEM_LOGIN_REQUIRED` with the item's short id. Reconnect that same Item with Plaid Link's update mode:
+
+```bash
+py -3.12 -m uv run python -m app.cli link --update 1a2b3c4d
+```
+
+`unlink` with no argument lists the short ids. Update mode re-authenticates the existing Item: it creates no new
+Item, uses no Trial slot, and stores nothing new, since the access token stays the same. The same localhost helper
+runs, with the same checks. Do **not** fix this with a plain `link`: that creates a second Item, uses another Trial
+slot in Production, and if the old Item recovers later its accounts are counted twice.
+
 **Wealthsimple caveat.** Plaid's coverage of Canadian investment accounts can be incomplete: some accounts, holdings
 or activity may be missing or late. `item_health` shows the last successful update. That gap is why the CSV fallback
 exists.
@@ -153,8 +167,10 @@ Git Bash, quote the path or use forward slashes. `claude mcp list` shows whether
 
 ## Security model
 
-- **Read-only.** Plaid Link asks only for the `investments` and `transactions` products. No transfer, payment, auth or
-  other money-movement endpoint is called or wrapped, and a test checks the product list and the client interface.
+- **Read-only.** Plaid Link asks only for the `investments` product, plus `transactions` where the institution
+  supports it (`required_if_supported_products`, so an institution without Transactions still links). No other
+  product is requested. No transfer, payment, auth or other money-movement endpoint is called or wrapped, and tests
+  check the product lists and the client interface.
 - **Secrets in the keychain.** The Plaid client_id, secrets and access tokens are stored only in the OS keychain via
   `keyring`. They are never written to files, logs, error messages or tool output. Plaid errors are reduced to the
   error code and display message. `.env` holds only the settings above.
@@ -162,7 +178,9 @@ Git Bash, quote the path or use forward slashes. `claude mcp list` shows whether
   revocable access token.
 - **Localhost Link helper.** `link` binds `127.0.0.1` on an ephemeral port (or `--port`), checks the `Host` and
   `Origin` headers, embeds a one-time random state token that the exchange must echo, accepts one successful exchange
-  and then exits, or exits after 10 minutes. The page has a CSP that only allows Plaid.
+  and then exits, or exits after 10 minutes. The page has a CSP that only allows Plaid. In update mode
+  (`link --update`) there is no token exchange: the page reports success once, with the same state token and checks,
+  and nothing is stored.
 - **Local only.** The server speaks stdio to the Claude app on this machine. It opens no port.
 - **Field minimisation.** Whatever a tool returns becomes model context, so tools return only what a question needs:
   accounts are referred to by an 8-character hash, never a Plaid id; masks are the last 4 characters; free text
@@ -190,8 +208,11 @@ are comfortable with that for the fields above.
    ```
 
    This calls Plaid `item_remove`, which invalidates the access token, then deletes the token from the keychain. If
-   Plaid says the item no longer exists, the local copy is removed anyway. On any other error the token is kept so
-   you can retry. In Production the Trial slot stays used.
+   Plaid says the item is already gone (`ITEM_NOT_FOUND` or `INVALID_ACCESS_TOKEN`), the local copy is removed
+   anyway. On any other error the token is kept so you can retry. In Production the Trial slot stays used.
+
+   `unlink 1a2b3c4d --local-only` deletes only the local token and list entry, without calling Plaid. It does not
+   revoke anything, so use it only when Plaid cannot be reached and you have removed the item in step 2.
 2. Remove the connection on Plaid's side too: in the Plaid dashboard, and as the account owner at
    [my.plaid.com](https://my.plaid.com), where you can see and disconnect apps linked to your Wealthsimple login.
 3. Delete `data/` to remove the local store, and remove the `personal-finance-mcp` entries from the Windows Credential
@@ -228,7 +249,8 @@ py -3.12 -m uv run pytest -q
 No test uses the network, a real Plaid account or the real keychain: Plaid is faked and every test runs with an
 in-memory keyring. `tests/test_e2e.py` starts `python -m app.server` as a subprocess and speaks MCP over stdio
 (initialize, tools/list, tools/call) in a test-only mode. That mode is switched on by `PFMCP_FAKE_PLAID=1` and is
-honoured only when `DATA_DIR` is inside pytest's temp directory, so it cannot turn on in a real setup.
+honoured only when `PYTEST_CURRENT_TEST` is set (pytest sets it for each test) and `DATA_DIR` is inside pytest's
+temp directory, so it cannot turn on in a real setup; otherwise it is ignored with a warning on stderr.
 
 ## License
 

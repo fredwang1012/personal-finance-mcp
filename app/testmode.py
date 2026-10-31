@@ -8,7 +8,7 @@ opened, and Plaid is replaced by a fake that never touches the network.
 """
 import os
 import tempfile
-from datetime import date
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 import keyring
@@ -76,8 +76,10 @@ class FakePlaid:
         return {"investment_transactions": [tx] if start <= end else [], "securities": []}
 
     def item_get(self, token):
-        return {"item": {"institution_name": "Wealthsimple", "products": ["investments", "transactions"],
-                         "status": {"investments": {"last_successful_update": f"{date.today()}T00:00:00Z"}}}}
+        # same shape as plaid-python's ItemGetResponse.to_dict(): status sits beside item and holds datetimes
+        today = datetime.combine(date.today(), time(), tzinfo=timezone.utc)
+        return {"item": {"institution_name": "Wealthsimple", "products": ["investments", "transactions"]},
+                "status": {"investments": {"last_successful_update": today}}}
 
 
 def install(env: str) -> None:

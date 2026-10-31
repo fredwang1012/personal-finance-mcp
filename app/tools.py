@@ -12,7 +12,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -60,11 +60,20 @@ def _public(row: dict) -> dict:
     return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
+def _reauth_hint(short: str) -> str:
+    return (f"Reconnect it with `{LINK_CMD} --update {short}`. A plain `{LINK_CMD}` would create a new Item "
+            "and use another Trial slot.")
+
+
+def _iso(value: Any) -> str:
+    return value.isoformat() if isinstance(value, datetime) else str(value or "")
+
+
 def _error_note(short: str, exc: Exception, clean: Callable[[str], str] = clean_text) -> str:
     if isinstance(exc, PlaidError):
         note = f"Plaid item {short} failed: {clean(exc.code)}: {clean(exc.message)}"
         if exc.code == "ITEM_LOGIN_REQUIRED":
-            note += f" Re-run `{LINK_CMD}` to reconnect it."
+            note += " " + _reauth_hint(short)
         return note
     return f"Plaid item {short} failed ({type(exc).__name__})."
 
@@ -526,22 +535,20 @@ def item_health(backend: Backend) -> dict:
         if not backend.api:
             break
         try:
-            item = backend.api.item_get(token).get("item") or {}
+            resp = backend.api.item_get(token)
+            item = resp.get("item") or {}
         except Exception as exc:
             notes.append(_error_note(short, exc, backend.clean))
             items.append({"id": short, "institution": None, "products": [], "last_successful_update": None,
                           "error_code": backend.clean(exc.code) if isinstance(exc, PlaidError) else type(exc).__name__})
             continue
-        status = item.get("status") or {}
-        updates = [
-            str((status.get(k) or {}).get("last_successful_update"))
-            for k in ("investments", "transactions")
-            if TIMESTAMP_RE.fullmatch(str((status.get(k) or {}).get("last_successful_update") or ""))
-        ]
+        status = resp.get("status") or {}  # top level of /item/get, beside "item"
+        stamps = (_iso((status.get(k) or {}).get("last_successful_update")) for k in ("investments", "transactions"))
+        updates = [t for t in stamps if TIMESTAMP_RE.fullmatch(t)]
         error = item.get("error") or {}
         code = backend.clean(_enum(error.get("error_code"))) or None
         if code == "ITEM_LOGIN_REQUIRED":
-            notes.append(f"Plaid item {short} needs re-authentication. Re-run `{LINK_CMD}` to reconnect it.")
+            notes.append(f"Plaid item {short} needs re-authentication. " + _reauth_hint(short))
         items.append({
             "id": short, "institution": backend.clean(item.get("institution_name") or "") or None,
             "products": sorted(backend.clean(_enum(p)) for p in item.get("products") or []),

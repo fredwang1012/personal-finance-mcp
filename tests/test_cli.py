@@ -219,3 +219,56 @@ def test_interrupted_prompt_cancels(linked, capsys, error, local_only):
     assert cli.run_unlink(lambda: fake, "sandbox", _short(ITEM_A), ask, local_only=local_only) == 1
     assert fake.removed == [] and secrets.get_access_token("sandbox", ITEM_A) == TOKEN_A
     assert "Cancelled" in capsys.readouterr().out
+
+
+def test_main_parses_link_update(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "link", lambda port=0, update_short=None: seen.append((port, update_short)) or 0)
+    assert cli.main(["link"]) == 0 and cli.main(["link", "--update", "abcd1234"]) == 0
+    assert seen == [(0, None), (0, "abcd1234")]
+
+
+def test_link_update_resolves_item_and_stores_nothing_new(linked, monkeypatch, capsys):
+    from app import link as link_mod
+
+    calls = []
+    monkeypatch.setattr(link_mod, "run_link", lambda api, env, port=0, update=None: calls.append(update) or 0)
+    assert cli.run_link_cli(lambda: FakePlaid(), "sandbox", update_short=_short(ITEM_B).upper()) == 0
+    assert calls == [(ITEM_B, TOKEN_B)]
+    assert sorted(secrets.list_item_ids("sandbox")) == sorted([ITEM_A, ITEM_B])
+    assert_clean(capsys.readouterr().out)
+
+
+def test_link_update_unknown_or_tokenless_item_is_refused(monkeypatch, capsys):
+    from app import link as link_mod
+
+    monkeypatch.setattr(link_mod, "run_link", lambda *a, **k: pytest.fail("must not start Link"))
+    secrets._save_items("sandbox", [ITEM_A])  # listed, but no token stored
+    assert cli.run_link_cli(lambda: FakePlaid(), "sandbox", update_short=ITEM_A) == 1  # raw id is not a short id
+    assert cli.run_link_cli(lambda: FakePlaid(), "sandbox", update_short=_short(ITEM_A)) == 1
+    captured = capsys.readouterr()
+    assert_clean(captured.out + captured.err)
+
+
+def test_link_update_drives_update_mode_end_to_end(linked, capsys):
+    class LinkFake(FakePlaid):
+        def create_link_token(self, access_token=None):
+            self.token_for = access_token
+            return "link-sandbox-update"
+
+    fake = LinkFake()
+    code = cli.run_link_cli(lambda: fake, "sandbox", update_short=_short(ITEM_A), open_browser=lambda _url: None,
+                            timeout=0.2)
+    assert code == 1 and fake.token_for == TOKEN_A  # timed out after starting Link in update mode
+    assert_clean(capsys.readouterr().out)
+
+
+def test_link_unexpected_error_prints_type_only(capsys):
+    class Broken(FakePlaid):
+        def create_link_token(self, access_token=None):
+            raise ConnectionError(f"failed to reach plaid with {TOKEN_A}")
+
+    assert cli.run_link_cli(lambda: Broken(), "sandbox") == 1
+    captured = capsys.readouterr()
+    assert "ConnectionError" in captured.err and TOKEN_A not in captured.out + captured.err
+    assert "Traceback" not in captured.err

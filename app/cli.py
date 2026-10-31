@@ -1,4 +1,4 @@
-"""Command line: python -m app.cli set-plaid-keys | status | link | unlink | import-csv."""
+"""Command line: python -m app.cli set-plaid-keys | status | link [--update ITEM_SHORT_ID] | unlink | import-csv."""
 import argparse
 import getpass
 import sys
@@ -32,15 +32,50 @@ def status() -> int:
     return 0
 
 
-def link(port: int = 0) -> int:
-    from app.link import run_link
-    from app.plaid_client import PlaidError, RealPlaid
-
+def _resolve_update(env: str, short_id: str) -> tuple[str, str] | None:
+    """(item_id, access_token) for the linked item with this short id, or None after printing why not."""
     try:
-        return run_link(RealPlaid.from_settings(settings), settings.plaid_env, port=port)
+        item_ids = secrets.list_item_ids(env)
+    except secrets.MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return None
+    wanted = short_id.strip().lower()
+    matches = [i for i in item_ids if short_hash(i) == wanted]
+    if not matches:
+        # the argument is not echoed, in case a raw item id or token was pasted
+        print("No linked item has that short id. Run `python -m app.cli unlink` to list them.", file=sys.stderr)
+        return None
+    token = _token_or_none(env, matches[0])
+    if token is None:
+        print(f"No access token is stored for item {wanted}; it cannot be updated. Unlink it and link again.",
+              file=sys.stderr)
+        return None
+    return matches[0], token
+
+
+def run_link_cli(api_factory, env: str, port: int = 0, update_short: str | None = None, **kwargs) -> int:
+    from app.link import run_link
+    from app.plaid_client import PlaidError
+
+    update = None
+    if update_short is not None:
+        update = _resolve_update(env, update_short)
+        if update is None:
+            return 1
+    try:
+        return run_link(api_factory(), env, port=port, update=update, **kwargs)
     except (secrets.MissingSecret, PlaidError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    except Exception as exc:  # e.g. a network error from create_link_token; its text could carry request data
+        print(f"Link failed ({type(exc).__name__}).", file=sys.stderr)
+        return 1
+
+
+def link(port: int = 0, update_short: str | None = None) -> int:
+    from app.plaid_client import RealPlaid
+
+    return run_link_cli(lambda: RealPlaid.from_settings(settings), settings.plaid_env, port, update_short)
 
 
 def _institution(api, token: str | None) -> str:
@@ -172,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
     link_parser.add_argument(
         "--port", type=int, default=0, help="fixed port on 127.0.0.1 (default 0 = ephemeral), e.g. for an SSH port-forward"
     )
+    link_parser.add_argument(
+        "--update", metavar="ITEM_SHORT_ID",
+        help="re-authenticate an existing item (e.g. after ITEM_LOGIN_REQUIRED) instead of linking a new one",
+    )
     unlink_parser = sub.add_parser("unlink", help="list linked items, or remove one from Plaid and the keychain")
     unlink_parser.add_argument("item", nargs="?", help="short id shown by `unlink` with no argument")
     unlink_parser.add_argument(
@@ -189,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--local-only needs an ITEM_SHORT_ID")
         return unlink(args.item, args.local_only)
     if args.command == "link":
-        return link(args.port)
+        return link(args.port, args.update)
     return {"set-plaid-keys": set_plaid_keys, "status": status}[args.command]()
 
 
