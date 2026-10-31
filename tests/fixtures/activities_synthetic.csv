@@ -1,0 +1,8 @@
+transaction_date,settlement_date,account_id,account_type,activity_type,activity_sub_type,direction,symbol,name,currency,quantity,share_price,net_cash_amount,description,extra_column
+2024-01-15,2024-01-17,TEST-0000-1111,TFSA,Trade,BUY,LONG,ZZTEST,Fake Equity Fund,CAD,10,25.50,-255.00,Bought 10 ZZTEST,x
+2024-01-20,2024-01-20,TEST-0000-1111,TFSA,Dividend,,,ZZTEST,Fake Equity Fund,CAD,,,1.25,Dividend ZZTEST,x
+2024-02-01,2024-02-01,TEST-0000-1111,TFSA,Trade,SELL,SHORT,ZZTEST,Fake Equity Fund,CAD,4,26.00,104.00,Sold 4 ZZTEST,x
+2024-02-05,2024-02-05,TEST-0000-2222,Non-registered,Deposit,EFT,,,,USD,,,"1,000.00",Deposit,x
+2024-02-28,2024-02-28,TEST-0000-2222,Non-registered,Interest,,,,,USD,,,0.42,Interest,x
+2024-03-01,2024-03-01,TEST-0000-2222,Non-registered,Fee,MGMT,,,,USD,,,($0.99),Monthly fee,x
+2024-03-02,2024-03-02,TEST-0000-2222,Non-registered,MoneyMovement,E_TRFOUT,,,,USD,,,-50.00,Transfer out,x

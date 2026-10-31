@@ -48,7 +48,13 @@ def main(argv: list[str] | None = None) -> int:
     link_parser.add_argument(
         "--port", type=int, default=0, help="fixed port on 127.0.0.1 (default 0 = ephemeral), e.g. for an SSH port-forward"
     )
+    csv_parser = sub.add_parser("import-csv", help="import Wealthsimple Activities / holdings CSV exports into the local store")
+    csv_parser.add_argument("paths", nargs="+", help="CSV files downloaded from Wealthsimple")
     args = parser.parse_args(argv)
+    if args.command == "import-csv":
+        from app.csvimport import import_paths
+
+        return import_paths(args.paths)
     if args.command == "link":
         return link(args.port)
     return {"set-plaid-keys": set_plaid_keys, "status": status}[args.command]()

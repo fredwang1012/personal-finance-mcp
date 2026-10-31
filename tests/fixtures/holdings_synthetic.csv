@@ -1,0 +1,3 @@
+Account Name,Account Type,Account Number,Symbol,Name,Exchange,Quantity,Market Price,Market Price Currency,Market Value,Book Value (Market),As Of
+Fake TFSA,TFSA,TEST-0000-1111,ZZTEST,Fake Equity Fund,TSX,6,26.10,CAD,156.60,153.00,2024-03-31
+Fake Crypto,Crypto,TEST-0000-3333,ZZCOIN,Fake Coin,,0.5,1000.00,CAD,500.00,400.00,2024-03-31
