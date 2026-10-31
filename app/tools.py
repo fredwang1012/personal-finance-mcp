@@ -535,6 +535,12 @@ def item_health(backend: Backend) -> dict:
         if not backend.api:
             break
         try:
+            # learn this item's account ids first so the scrubber can remove them from free text below; every tool
+            # call has a fresh Backend, so nothing else may have loaded them yet
+            backend._pids.update(a["account_id"] for a in backend.api.accounts_get(token).get("accounts", []))
+        except Exception:
+            pass  # item_get below reports the problem
+        try:
             resp = backend.api.item_get(token)
             item = resp.get("item") or {}
         except Exception as exc:

@@ -30,3 +30,12 @@ def memory_keyring():
     keyring.set_keyring(backend)
     yield backend
     keyring.set_keyring(previous)
+
+
+@pytest.fixture(autouse=True)
+def keyring_secrets_backend(monkeypatch):
+    """Tests default to the keychain backend whatever the local .env says; systemd tests switch explicitly."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "secrets_backend", "keyring")
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)

@@ -287,6 +287,55 @@ def import_bundle(env: str, inp=None) -> int:
     return 0
 
 
+def _client_admin():
+    from app.auth import ClientAdmin
+
+    return ClientAdmin(settings.data_dir / "oauth.db")
+
+
+def list_clients() -> int:
+    admin = _client_admin()
+    try:
+        rows = admin.rows()
+    finally:
+        admin.close()
+    if not rows:
+        print("No registered OAuth clients.")
+        return 0
+    print(f"{'fingerprint':<12} {'status':<9} {'registered':<24} {'last used':<24} name")
+    for r in rows:
+        print(f"{r['fingerprint']:<12} {r['status']:<9} {r['registered']:<24} {r['last_used']:<24} "
+              f"{clean_text(r['name'])}")
+    return 0
+
+
+def approve_client(fp: str) -> int:
+    admin = _client_admin()
+    try:
+        done = admin.approve(fp)
+    finally:
+        admin.close()
+    if done is None:
+        print("No single pending client has that fingerprint (pending requests expire after 30 minutes). "
+              "Run list-clients.", file=sys.stderr)
+        return 1
+    print(f"Approved client {done}. Click Connect in Claude again to finish.")
+    return 0
+
+
+def revoke_client(fp: str) -> int:
+    admin = _client_admin()
+    try:
+        done = admin.revoke(fp)
+    finally:
+        admin.close()
+    if done is None:
+        print("No single active client has that fingerprint. Run list-clients.", file=sys.stderr)
+        return 1
+    print(f"Revoked client {done} and deleted all of its tokens.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -313,7 +362,17 @@ def main(argv: list[str] | None = None) -> int:
     remote_parser.add_argument("--rotate-signing-key", action="store_true", help="replace the signing key")
     sub.add_parser("export-bundle", help="write Plaid keys and tokens as JSON to a pipe (for moving them to the server)")
     sub.add_parser("import-bundle", help="read an export bundle from a pipe into systemd credentials (server, as root)")
+    sub.add_parser("list-clients", help="list OAuth clients of the remote connector (fingerprint, status, use)")
+    for name, what in (("approve-client", "approve one pending OAuth client"),
+                       ("revoke-client", "revoke an OAuth client and delete its tokens")):
+        sub.add_parser(name, help=what).add_argument("fingerprint", help="8-character fingerprint from list-clients")
     args = parser.parse_args(argv)
+    if args.command == "list-clients":
+        return list_clients()
+    if args.command == "approve-client":
+        return approve_client(args.fingerprint)
+    if args.command == "revoke-client":
+        return revoke_client(args.fingerprint)
     if args.command == "serve-http":
         from app import remote
 

@@ -8,7 +8,11 @@ middleware); this module supplies the provider behind them plus two pages of its
   Claude's callback -> /token.
 
 Rules enforced here:
-- Dynamic client registration accepts only Claude's documented callback URLs as redirect URIs.
+- Dynamic client registration accepts only Claude's documented callback URLs as redirect URIs, and every new client
+  starts `pending`: it gets no code until the owner approves it on the server (`python -m app.cli approve-client FP`).
+  Otherwise anyone could add this URL in their own claude.ai account and send the owner the sign-in link; the owner
+  would see "Allow Claude?" and the code would land in the attacker's Claude session. Pending clients expire after
+  30 minutes and at most 20 may wait at once.
 - The `resource` (RFC 8707) must be this server's MCP URL; tokens are bound to it and checked on every request.
 - Access tokens live one hour. Refresh tokens rotate on every use; presenting a used one revokes its whole family.
 - Codes and tokens are random strings stored only as HMAC-SHA256 digests keyed by the signing key; client secrets
@@ -47,6 +51,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from app.audit import Audit
+from app.redact import short_hash
 
 CLAUDE_CALLBACKS = frozenset({"https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"})
 SCOPE = "finance.read"
@@ -57,6 +62,9 @@ CODE_TTL = 300
 LOGIN_TTL = 600
 CONSENT_TTL = 300
 MAX_CLIENTS = 50
+MAX_PENDING_CLIENTS = 20
+PENDING_CLIENT_TTL = 1800
+APPROVE_CMD = "python -m app.cli approve-client"
 MAX_PENDING = 50
 MAX_CLIENT_NAME = 80
 GITHUB_CALLBACK_PATH = "/oauth/github/callback"
@@ -147,13 +155,82 @@ class GitHub:
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS clients (client_id TEXT PRIMARY KEY, metadata TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS clients (
+    client_id TEXT PRIMARY KEY, metadata TEXT NOT NULL, created_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', last_used REAL
+);
 CREATE TABLE IF NOT EXISTS tokens (
     hash TEXT PRIMARY KEY, kind TEXT NOT NULL, client_id TEXT NOT NULL, scopes TEXT NOT NULL, resource TEXT NOT NULL,
     subject TEXT, family TEXT NOT NULL, family_created REAL NOT NULL, expires_at REAL NOT NULL, used_at REAL
 );
 CREATE INDEX IF NOT EXISTS tokens_family ON tokens(family);
 """
+
+
+def fingerprint(client_id: str) -> str:
+    """8-character id the owner types to approve or revoke a client."""
+    return short_hash(client_id)
+
+
+def _when(ts: float | None) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts)) if ts else "never"
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=5)
+    db.executescript(SCHEMA)
+    return db
+
+
+def purge_clients(db: sqlite3.Connection, now: float) -> None:
+    """Drop expired pending clients and long-revoked ones; neither holds tokens."""
+    db.execute("DELETE FROM clients WHERE status = 'pending' AND created_at < ?", (now - PENDING_CLIENT_TTL,))
+    db.execute("DELETE FROM clients WHERE status = 'revoked' AND created_at < ? AND client_id NOT IN "
+               "(SELECT client_id FROM tokens)", (now - 30 * 86400,))
+
+
+class ClientAdmin:
+    """Owner commands on the server (list-clients, approve-client, revoke-client); they need no secrets."""
+
+    def __init__(self, db_path: Path, clock: Callable[[], float] = time.time):
+        self.db, self.clock = open_db(db_path), clock
+
+    def rows(self) -> list[dict]:
+        purge_clients(self.db, self.clock())
+        rows = self.db.execute("SELECT client_id, metadata, created_at, status, last_used FROM clients "
+                               "ORDER BY created_at").fetchall()
+        return [{"fingerprint": fingerprint(cid), "name": (json.loads(meta).get("client_name") or "")[:MAX_CLIENT_NAME],
+                 "registered": _when(created), "status": status, "last_used": _when(used)}
+                for cid, meta, created, status, used in rows]
+
+    def _match(self, fp: str, statuses: tuple[str, ...]) -> list[str]:
+        purge_clients(self.db, self.clock())
+        marks = ",".join("?" * len(statuses))
+        ids = [r[0] for r in self.db.execute(f"SELECT client_id FROM clients WHERE status IN ({marks})", statuses)]
+        wanted = fp.strip().lower()
+        return [cid for cid in ids if hmac.compare_digest(fingerprint(cid), wanted)]
+
+    def approve(self, fp: str) -> str | None:
+        """Approve exactly one pending client; its fingerprint, or None when none or several match."""
+        matches = self._match(fp, ("pending",))
+        if len(matches) != 1:
+            return None
+        self.db.execute("UPDATE clients SET status = 'approved' WHERE client_id = ? AND status = 'pending'",
+                        (matches[0],))
+        return fingerprint(matches[0])
+
+    def revoke(self, fp: str) -> str | None:
+        """Revoke one client and delete every token it holds."""
+        matches = self._match(fp, ("pending", "approved"))
+        if len(matches) != 1:
+            return None
+        self.db.execute("DELETE FROM tokens WHERE client_id = ?", (matches[0],))
+        self.db.execute("UPDATE clients SET status = 'revoked' WHERE client_id = ?", (matches[0],))
+        return fingerprint(matches[0])
+
+    def close(self) -> None:
+        self.db.close()
 
 
 def _page(title: str, body: str, status: int = 200, headers: dict | None = None) -> HTMLResponse:
@@ -179,9 +256,7 @@ class OwnerOAuthProvider:
     def __init__(self, cfg: AuthConfig, github, audit: Audit, clock: Callable[[], float] = time.time):
         self.cfg, self.github, self.audit, self.clock = cfg, github, audit, clock
         self._lock = threading.Lock()
-        cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(cfg.db_path, check_same_thread=False, isolation_level=None)
-        self.db.executescript(SCHEMA)
+        self.db = open_db(cfg.db_path)
         self._pending: dict[str, dict] = {}   # GitHub state -> authorization request waiting for login
         self._consents: dict[str, dict] = {}  # consent id -> approved login waiting for the owner's click
         self._codes: dict[str, dict] = {}     # code digest -> authorization code
@@ -204,10 +279,23 @@ class OwnerOAuthProvider:
 
     # --- clients (dynamic registration) -------------------------------------------------------------------------
 
+    def _client_row(self, client_id: str):
+        """(status, created_at) of a client, or None. Expired pending clients are purged first."""
+        with self._lock:
+            purge_clients(self.db, self.clock())
+            return self.db.execute("SELECT status, created_at FROM clients WHERE client_id = ?",
+                                   (client_id,)).fetchone()
+
+    def _approved(self, client_id: str) -> bool:
+        row = self._client_row(client_id)
+        return row is not None and row[0] == "approved"
+
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         with self._lock:
-            row = self.db.execute("SELECT metadata FROM clients WHERE client_id = ?", (client_id,)).fetchone()
-        if row is None:
+            purge_clients(self.db, self.clock())
+            row = self.db.execute("SELECT metadata FROM clients WHERE client_id = ? AND status != 'revoked'",
+                                  (client_id,)).fetchone()
+        if row is None:  # unknown or revoked: the token endpoint answers invalid_client, so Claude re-registers
             return None
         info = OAuthClientInformationFull.model_validate_json(row[0])
         if info.token_endpoint_auth_method != "none":
@@ -224,17 +312,16 @@ class OwnerOAuthProvider:
             client_info.client_name = client_info.client_name[:MAX_CLIENT_NAME]
         now = self.clock()
         with self._lock:
-            # clients that never got a token within a day are dropped, so anonymous registrations cannot pile up
-            self.db.execute("DELETE FROM clients WHERE created_at < ? AND client_id NOT IN "
-                            "(SELECT client_id FROM tokens)", (now - 86400,))
+            purge_clients(self.db, now)
+            pending = self.db.execute("SELECT COUNT(*) FROM clients WHERE status = 'pending'").fetchone()[0]
             count = self.db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
-            if count >= MAX_CLIENTS:
+            if pending >= MAX_PENDING_CLIENTS or count >= MAX_CLIENTS:
                 raise RegistrationError("invalid_client_metadata", "Too many registered clients; try again later.")
             if client_info.token_endpoint_auth_method != "none":
                 # the SDK minted a random secret; replace it with one derived from the signing key so none is stored
                 client_info.client_secret = self.client_secret_for(client_info.client_id)
             stored = client_info.model_copy(update={"client_secret": None})
-            self.db.execute("INSERT INTO clients VALUES (?, ?, ?)",
+            self.db.execute("INSERT INTO clients (client_id, metadata, created_at, status) VALUES (?, ?, ?, 'pending')",
                             (client_info.client_id, stored.model_dump_json(), now))
         self.audit.event("client_registered", client=client_info.client_id, client_name=client_info.client_name)
 
@@ -280,17 +367,38 @@ class OwnerOAuthProvider:
         if not hmac.compare_digest(str(uid), str(self.cfg.allowed_user_id)):
             self.audit.event("login_denied", client=pending["client_id"], github_user_id=uid)
             return _page("Not allowed", "<h1>Not allowed</h1><p>This GitHub account cannot use this server.</p>", 403)
+        client_row = self._client_row(pending["client_id"])
+        if client_row is None or client_row[0] == "revoked":
+            return _page("Connection removed", "<h1>This connection was removed or expired</h1>"
+                         "<p>Remove the connector in Claude and add it again.</p>", 403)
+        fp = fingerprint(pending["client_id"])
+        name = html.escape(pending["client_name"] or "An unnamed client")
+        registered = html.escape(_when(client_row[1]))
+        if client_row[0] == "pending":
+            # nothing is issued: the owner must confirm on the server that this registration is their own
+            self.audit.event("login_pending_client", client=pending["client_id"])
+            body = (
+                "<h1>New connection needs approval</h1>"
+                f"<p><b>{name}</b> registered at {registered}, fingerprint <code>{fp}</code>.</p>"
+                f"<p>To allow this connection, run on the server: <code>{APPROVE_CMD} {fp}</code>. "
+                "Only do this if you just clicked Connect in your own claude.ai.</p>"
+                f"<p>On the VM that is <code>sudo pfmcp approve-client {fp}</code>. Then click Connect in Claude "
+                "again. The request expires 30 minutes after it was registered.</p>"
+                "<p>If you did not just click Connect yourself, do nothing: someone may be trying to get you to "
+                "give their Claude account access to your data.</p>"
+            )
+            return _page("Approval needed", body, 403)
         consent_id, csrf = pysecrets.token_urlsafe(32), pysecrets.token_urlsafe(32)
         with self._lock:
             self._expire(self._consents, self.clock())
             self._consents[consent_id] = {**pending, "csrf": csrf, "subject": str(uid),
                                           "expires_at": self.clock() + CONSENT_TTL}
         self.audit.event("login_allowed", client=pending["client_id"])
-        name = html.escape(pending["client_name"] or "An unnamed client")
         host = html.escape(urllib.parse.urlsplit(pending["redirect_uri"]).hostname or "")
         body = (
             f"<h1>Allow {name}?</h1>"
-            f"<p><b>{name}</b> (client id <code>{html.escape(pending['client_id'])}</code>) is asking for read-only "
+            f"<p><b>{name}</b> (fingerprint <code>{fp}</code>, registered {registered}, approved on the server) "
+            "is asking for read-only "
             "access to your personal finance data: accounts, balances, holdings and transactions. "
             "It cannot move money or change anything.</p>"
             f"<p>After you choose, you will be sent back to <b>{host}</b>.</p>"
@@ -311,7 +419,7 @@ class OwnerOAuthProvider:
         if (entry is None or not csrf or not hmac.compare_digest(csrf, entry["csrf"])
                 or not hmac.compare_digest(cookie, entry["csrf"])):
             return _page("Request expired", "<h1>Request expired</h1><p>Start again from Claude.</p>", 400)
-        if form.get("action") != "approve":
+        if form.get("action") != "approve" or not self._approved(entry["client_id"]):
             self.audit.event("consent_denied", client=entry["client_id"])
             return self._redirect_error(entry, "access_denied")
         code = pysecrets.token_urlsafe(32)
@@ -344,6 +452,7 @@ class OwnerOAuthProvider:
                 (self._digest("token", refresh), "refresh", refresh_expiry)]
         with self._lock:
             self.db.execute("DELETE FROM tokens WHERE expires_at < ?", (now,))
+            self.db.execute("UPDATE clients SET last_used = ? WHERE client_id = ?", (now, client_id))
             for digest, kind, expires in rows:
                 self.db.execute("INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                                 (digest, kind, client_id, " ".join(scopes), self.cfg.resource, subject, family,
@@ -370,7 +479,7 @@ class OwnerOAuthProvider:
     async def exchange_authorization_code(self, client: OAuthClientInformationFull, authorization_code) -> OAuthToken:
         with self._lock:  # pop first, so a code can be redeemed once even under concurrent requests
             entry = self._codes.pop(self._digest("code", authorization_code.code), None)
-        if entry is None:
+        if entry is None or not self._approved(client.client_id):
             raise TokenError("invalid_grant", "authorization code does not exist")
         tokens = self._issue(client.client_id, entry["scopes"], entry["subject"], pysecrets.token_urlsafe(16),
                              self.clock())
@@ -386,7 +495,8 @@ class OwnerOAuthProvider:
             self._revoke_family(row["family"])
             self.audit.event("refresh_reuse_revoked", client=client.client_id)
             return None
-        if row["expires_at"] < self.clock() or not self.check_resource(row["resource"]):
+        if (row["expires_at"] < self.clock() or not self.check_resource(row["resource"])
+                or not self._approved(row["client_id"])):
             return None
         return RefreshToken(token=refresh_token, client_id=row["client_id"], scopes=row["scopes"].split(),
                             expires_at=int(row["expires_at"]), resource=row["resource"], subject=row["subject"])
@@ -405,7 +515,8 @@ class OwnerOAuthProvider:
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         row = self._row(token, "access")
-        if row is None or row["expires_at"] < self.clock() or not self.check_resource(row["resource"]):
+        if (row is None or row["expires_at"] < self.clock() or not self.check_resource(row["resource"])
+                or not self._approved(row["client_id"])):
             return None
         return AccessToken(token=token, client_id=row["client_id"], scopes=row["scopes"].split(),
                            expires_at=int(row["expires_at"]), resource=row["resource"], subject=row["subject"])

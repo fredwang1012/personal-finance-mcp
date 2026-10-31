@@ -473,3 +473,10 @@ def test_invalid_currency_codes_become_placeholder(tmp_path):
     assert outs[1]["holdings"][0]["currency"] == "???"
     assert outs[2]["transactions"][0]["currency"] == "???"
     assert all(any("invalid currency" in n for n in o["notes"]) for o in outs)
+
+
+def test_item_health_alone_scrubs_account_ids(csv_conn):
+    # each server call has a fresh Backend, so item_health must learn account ids itself before cleaning text
+    b = tools.Backend(csv_conn, HostilePlaid(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    blob = json.dumps(tools.item_health(b))
+    assert PID_TFSA not in blob and TOKEN_OK not in blob and "WS" in blob
