@@ -280,7 +280,9 @@ class Guard:
         request_ip.set(ip)
         if bearer:  # limited per OAuth client in layer 2 once the token is checked
             return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
-        slot = ip_bucket(ip)  # an IPv6 client controls a whole /64, so the network is the unit
+        # an IPv6 client controls a whole /64, so that is the unit; IPv4 stays per address so neighbours on a
+        # shared /24 (campus, CGNAT) cannot fill the owner's slots
+        slot = ip_bucket(ip) if ":" in ip else ip
         if self._in_flight.get(slot, 0) >= self.anon_concurrency:
             return await _too_many(send, 1)
         self._in_flight[slot] = self._in_flight.get(slot, 0) + 1

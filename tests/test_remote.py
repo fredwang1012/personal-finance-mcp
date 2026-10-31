@@ -1090,3 +1090,28 @@ def test_revoke_all_clients(remote, monkeypatch, capsys):
     assert cli.main(["list-clients"]) == 0
     rows = [line.split()[1] for line in capsys.readouterr().out.splitlines()[1:-1]]
     assert rows == ["revoked", "revoked"]
+
+
+def test_ipv4_neighbours_in_one_24_do_not_share_the_in_flight_cap():
+    release = None
+
+    async def blocking(scope, receive, send):
+        await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        guard = Guard(blocking, RateLimiter(), Limits(), RESOURCE, anon_concurrency=2)
+        calls = [_guard_call(guard, client=("203.0.113.5", 1000)) for _ in range(2)]
+        tasks = [asyncio.create_task(c) for c, _ in calls]
+        await asyncio.sleep(0.01)
+        neighbour, neighbour_sent = _guard_call(guard, client=("203.0.113.6", 1000))
+        neighbour_task = asyncio.create_task(neighbour)
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(*tasks, neighbour_task)
+        return neighbour_sent
+
+    assert asyncio.run(run())[0]["status"] == 200
