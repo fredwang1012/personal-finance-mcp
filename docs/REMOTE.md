@@ -4,7 +4,8 @@ This runs the same five read-only tools on a small Linux VM so that Claude on th
 claude.ai calls custom connectors from Anthropic's cloud, so the server must be reachable over public HTTPS and
 protected by OAuth.
 
-- **Host:** an Oracle Cloud Always Free VM (Ubuntu 24.04 or Oracle Linux 9).
+- **Host:** an Oracle Cloud Always Free x86_64 VM running Ubuntu 24.04 (systemd 255). Oracle Linux 9 and the Arm
+  (aarch64) shape also work but are secondary.
 - **Public URL:** Tailscale Funnel, `https://<machine>.<tailnet>.ts.net`. No inbound port is opened for it.
 - **Login:** your GitHub account, checked by numeric user id. Any other account gets 403 and nothing is issued.
 - **Approval:** each client that Claude registers must be approved once on the server before it gets anything.
@@ -45,9 +46,9 @@ for the service. They are never stored as plaintext files.
 ## 2. The VM
 
 1. **Create the instance.** **Compute** → **Instances** → **Create instance**:
-   - Image: **Canonical Ubuntu 24.04**, or Oracle Linux 9. You need systemd 250 or later, which both have.
-   - Shape: `VM.Standard.A1.Flex` (Always Free eligible), 1 OCPU and 6 GB is plenty. `VM.Standard.E2.1.Micro` also
-     works.
+   - Image: **Canonical Ubuntu 24.04** (the tested target). Oracle Linux 9 also works. You need systemd 250 or later.
+   - Shape: `VM.Standard.E2.1.Micro` (x86_64, Always Free eligible), the tested target. The Arm shape
+     `VM.Standard.A1.Flex` (aarch64) also works; its uv hash in `setup.sh` has not been run on hardware.
    - SSH keys: paste your **public** key. Do not let Oracle generate a password.
 2. **Use SSH keys only.** The Ubuntu image already disables password login. Check, and enforce it:
 
@@ -123,12 +124,13 @@ The repository is not pushed anywhere, so copy a snapshot over SSH from the lapt
 git archive --format=tar remote | ssh ubuntu@<public-ip> \
   "sudo mkdir -p /opt/personal-finance-mcp && sudo tar -x -C /opt/personal-finance-mcp"
 ssh ubuntu@<public-ip>
-sudo UV_SHA256=<verified hash> bash /opt/personal-finance-mcp/deploy/setup.sh
+sudo bash /opt/personal-finance-mcp/deploy/setup.sh
 ```
 
-`setup.sh` refuses to install uv without `UV_SHA256`: the SHA-256 of `uv-aarch64-unknown-linux-gnu.tar.gz` (or the
-x86_64 one) for the uv version pinned in the script. Get it from a source other than the download itself, for example
-`gh attestation verify <file> --repo astral-sh/uv` on the laptop, and pass it as above or write it into the script.
+`setup.sh` installs uv 0.13.5 only if the download matches the SHA-256 pinned in the script. The x86_64 hash was
+checked against a real download on the VM; the aarch64 one comes from the same source but has not been run on
+hardware. To change the uv version, update `UV_VERSION` and both hashes together, with hashes verified out of band
+(for example `gh attestation verify <file> --repo astral-sh/uv`). A missing or malformed hash stops setup.
 
 `setup.sh` does the following:
 - Installs Python 3.12 and uv.
@@ -304,8 +306,9 @@ at most 20 wait at once, the oldest giving way.
   - A code works once. Replaying it revokes the tokens it issued, and a wrong PKCE verifier destroys it.
   - Codes and tokens are stored only as HMAC digests keyed by the signing key.
 - **Limits:**
-  - Request bodies are capped at 64 KiB, and each chunk of a body must arrive within 10 seconds (else 408).
-  - At most 4 requests without a bearer token can be in flight at once from one address (else 429).
+  - Request bodies are capped at 64 KiB, and the whole body must arrive within 10 seconds (else 408).
+  - At most 4 requests without a bearer token can be in flight at once from one address (/24 for IPv4, /64 for IPv6;
+    else 429).
   - Requests without a forwarded client address get 503 (see the deploy gate in step 7).
   - Rate limits come in two layers (over a limit gives 429). The model is in the `RateLimiter` docstring in
     `app/remote.py`.

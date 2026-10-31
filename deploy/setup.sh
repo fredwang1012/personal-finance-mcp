@@ -37,12 +37,11 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 
 echo "== uv $UV_VERSION"
-# REQUIRED: the SHA-256 of uv-<triple>.tar.gz for UV_VERSION, verified once from a source other than the download
-# itself (for example `gh attestation verify uv-<triple>.tar.gz --repo astral-sh/uv` on the laptop, or the hash in the
-# release notes compared on two machines). A .sha256 file from the same server would prove nothing, so none is used:
-# setup stops unless the hash for this machine's CPU is set here or passed in the environment.
-UV_SHA256_AARCH64="${UV_SHA256_AARCH64:-}"   # uv 0.13.5, aarch64-unknown-linux-gnu (Oracle Ampere): SET ME
-UV_SHA256_X86_64="${UV_SHA256_X86_64:-}"     # uv 0.13.5, x86_64-unknown-linux-gnu: SET ME
+# Pinned SHA-256 of uv-<triple>.tar.gz for UV_VERSION, checked instead of a .sha256 file from the same server (which
+# would prove nothing). Change UV_VERSION and these together, with hashes verified out of band. Setup stops if the
+# hash for this machine's CPU is missing or malformed.
+UV_SHA256_X86_64="f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"   # 0.13.5, verified on the VM
+UV_SHA256_AARCH64="4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403"  # 0.13.5, same source, not run on hardware
 if ! command -v uv >/dev/null || [[ "$(uv --version | awk '{print $2}')" != "$UV_VERSION" ]]; then
     case "$(uname -m)" in
         x86_64) triple=x86_64-unknown-linux-gnu; UV_SHA256="${UV_SHA256:-$UV_SHA256_X86_64}" ;;

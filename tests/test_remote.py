@@ -994,6 +994,55 @@ def test_slow_request_body_times_out_with_408():
     assert sent[0]["status"] == 200
 
 
+def test_trickled_body_hits_the_total_deadline():
+    from app.remote import _send_json
+
+    async def reader(scope, receive, send):
+        while (await receive()).get("more_body"):
+            pass
+        await _send_json(send, 200, {})
+
+    guard = Guard(reader, RateLimiter(), Limits(), RESOURCE, body_timeout=0.2)
+    chunks = []
+
+    async def trickle():  # each chunk well inside 0.2 s, but the body never ends
+        await asyncio.sleep(0.05)
+        chunks.append(1)
+        return {"type": "http.request", "body": b" ", "more_body": True}
+
+    async def run():
+        call, sent = _guard_call(guard, receive=trickle)
+        await asyncio.wait_for(call, 2)
+        return sent
+
+    sent = asyncio.run(run())
+    assert sent[0]["status"] == 408 and 2 <= len(chunks) <= 6
+
+
+def test_ipv6_clients_in_one_64_share_the_in_flight_cap():
+    release = None
+
+    async def blocking(scope, receive, send):
+        await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        guard = Guard(blocking, RateLimiter(), Limits(), RESOURCE, anon_concurrency=2)
+        calls = [_guard_call(guard, client=(f"2001:db8:1:2::{i}", 1000)) for i in (1, 2)]
+        tasks = [asyncio.create_task(c) for c, _ in calls]
+        await asyncio.sleep(0.01)
+        over, over_sent = _guard_call(guard, client=("2001:db8:1:2:ffff::9", 1000))
+        await over
+        release.set()
+        await asyncio.gather(*tasks)
+        return over_sent
+
+    assert asyncio.run(run())[0]["status"] == 429
+
+
 def test_anonymous_requests_capped_per_address_in_flight():
     release = None
 

@@ -41,8 +41,8 @@ from app.auth import (
 log = logging.getLogger("personal-finance-mcp.remote")
 
 MAX_BODY = 64 * 1024  # MCP requests here are tiny tool calls; DCR and token forms are smaller still
-BODY_TIMEOUT = 10.0  # seconds to wait for each chunk of a request body before answering 408
-ANON_CONCURRENCY = 4  # requests in flight at once per address without a bearer token
+BODY_TIMEOUT = 10.0  # seconds for the whole request body to arrive before answering 408
+ANON_CONCURRENCY = 4  # requests in flight at once per address (/24 or /64) without a bearer token
 LOOPBACK = ("127.0.0.1", "::1")
 MISCONFIGURED = {"error": "misconfigured_proxy", "error_description": "The proxy did not forward the client address."}
 TOOL_NAMES = frozenset(fn.__name__ for fn, _ in server.TOOLS)
@@ -227,7 +227,7 @@ class Guard:
         self.app, self.limiter, self.limits, self.resource, self.provider = app, limiter, limits, resource, provider
         self.require_forwarded_for, self.body_timeout = require_forwarded_for, body_timeout
         self.anon_concurrency = anon_concurrency
-        self._in_flight: dict[str, int] = {}  # anonymous requests per address; an entry is removed at zero
+        self._in_flight: dict[str, int] = {}  # anonymous requests per ip_bucket; an entry is removed at zero
         self._warned_no_forwarded_ip = False
 
     async def __call__(self, scope, receive, send):
@@ -280,15 +280,16 @@ class Guard:
         request_ip.set(ip)
         if bearer:  # limited per OAuth client in layer 2 once the token is checked
             return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
-        if self._in_flight.get(ip, 0) >= self.anon_concurrency:
+        slot = ip_bucket(ip)  # an IPv6 client controls a whole /64, so the network is the unit
+        if self._in_flight.get(slot, 0) >= self.anon_concurrency:
             return await _too_many(send, 1)
-        self._in_flight[ip] = self._in_flight.get(ip, 0) + 1
+        self._in_flight[slot] = self._in_flight.get(slot, 0) + 1
         try:
             return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
         finally:
-            self._in_flight[ip] -= 1
-            if not self._in_flight[ip]:
-                del self._in_flight[ip]
+            self._in_flight[slot] -= 1
+            if not self._in_flight[slot]:
+                del self._in_flight[slot]
 
     async def _admitted(self, scope, receive, send, path, method, ip, headers, bearer, unforwarded):
         try:
@@ -319,13 +320,18 @@ class Guard:
                 return await _too_many(send, retry)
 
         received, body_done = 0, False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.body_timeout  # for the whole body, so trickling chunks cannot hold a slot
 
         async def counted_receive():
             nonlocal received, body_done
             if body_done:  # after the body, receive() only waits for a disconnect: no timeout there
                 return await receive()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _BodyTimeout()
             try:
-                message = await asyncio.wait_for(receive(), self.body_timeout)
+                message = await asyncio.wait_for(receive(), remaining)
             except asyncio.TimeoutError:
                 raise _BodyTimeout() from None
             if message["type"] == "http.request":
