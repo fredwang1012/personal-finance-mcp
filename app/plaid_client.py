@@ -1,6 +1,7 @@
 """Thin read-only wrapper over plaid-python. Only investments and transactions are ever requested, and no
 money-movement endpoint is wrapped. Methods return plain dicts so callers and test fakes share one shape."""
 import json
+import re
 from datetime import date
 from typing import Any, Protocol
 
@@ -20,12 +21,14 @@ from plaid.model.products import Products
 from plaid.model.transactions_sync_request import TransactionsSyncRequest
 
 from app import secrets
+from app.redact import clean_text
 
 # Investments is required; transactions is used only where the institution supports it, so an institution without
 # Transactions still links. These two are the only products ever requested.
 PRODUCTS = ["investments"]
 REQUIRED_IF_SUPPORTED_PRODUCTS = ["transactions"]
 CLIENT_NAME = "personal-finance-mcp"
+TOKEN_SHAPE = re.compile(r"(?:access|link|public)-[a-z]+-[\w-]+")
 LOCAL_USER_ID = "owner"
 _PAGE = 500
 REQUEST_TIMEOUT = 30  # seconds, passed to every Plaid call
@@ -56,7 +59,10 @@ def _translate(exc: plaid.ApiException) -> PlaidError:
     try:
         body = json.loads(exc.body or "{}")
         code = body.get("error_code") or code
-        message = body.get("display_message") or message
+        # display_message is meant for end users and is often null; error_message says which field or key is wrong.
+        # Plaid's messages carry no secrets, but they are cleaned and capped since they can reach model context.
+        message = body.get("display_message") or body.get("error_message") or message
+        message = TOKEN_SHAPE.sub("[redacted]", clean_text(str(message)))[:200]
     except (ValueError, TypeError, AttributeError):
         pass
     return PlaidError(code, message)

@@ -117,3 +117,15 @@ def test_investment_transactions_pages_merge_and_dedupe_securities():
     assert offsets == [0, 2]
     assert [t["n"] for t in out["investment_transactions"]] == [1, 2, 3]
     assert [s["security_id"] for s in out["securities"]] == ["a", "b", "c"]
+
+
+def test_translate_uses_error_message_when_display_message_is_null():
+    import json as _json
+    import plaid as _plaid
+    from app import plaid_client
+    exc = _plaid.ApiException(status=400)
+    exc.body = _json.dumps({"error_code": "INVALID_FIELD", "display_message": None,
+                            "error_message": "client_name must be at most 30 characters for access-sandbox-abc-123"}).encode()
+    err = plaid_client._translate(exc)
+    assert err.code == "INVALID_FIELD"
+    assert "client_name" in str(err) and "access-sandbox" not in str(err)
