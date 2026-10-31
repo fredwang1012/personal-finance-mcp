@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from app import secrets
+from app.config import settings
 from app.plaid_client import PlaidAPI, PlaidError
 from app.redact import short_hash
 
@@ -199,7 +200,7 @@ class _Handler(BaseHTTPRequestHandler):
         except PlaidError as exc:
             print(f"Plaid rejected the link: {exc.code}")
             return self._send(502, b"exchange failed")
-        print(f"Linked item {short_hash(item_id)}. Token stored in the OS keychain.")
+        print(f"Linked item {short_hash(item_id)}. Token stored ({settings.secrets_backend} backend).")
         self.server.stop_soon()  # before replying, so a broken pipe cannot keep the helper alive
         self._send(200, b'{"ok": true}', "application/json")
 

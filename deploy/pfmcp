@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Admin wrapper for personal-finance-mcp on the server, installed as /usr/local/bin/pfmcp. Run with sudo.
+#
+#   sudo pfmcp list-clients | approve-client FP | revoke-client FP   (run as the service user)
+#   sudo pfmcp status | import-bundle | link --port N | unlink ...    (run as root: systemd-creds needs the host key)
+set -euo pipefail
+
+APP=/opt/personal-finance-mcp
+if [[ $EUID -ne 0 ]]; then
+    echo "run with sudo" >&2
+    exit 1
+fi
+set -a
+# shellcheck disable=SC1091
+. /etc/personal-finance-mcp/env
+set +a
+cd "$APP"
+case "${1:-}" in
+    list-clients|approve-client|revoke-client)
+        exec runuser -u pfmcp -- "$APP/.venv/bin/python" -m app.cli "$@" ;;
+    status|import-bundle|link|unlink)
+        exec "$APP/.venv/bin/python" -m app.cli "$@" ;;
+    *)
+        echo "usage: sudo pfmcp list-clients | approve-client FP | revoke-client FP | status | import-bundle |" \
+             "link --port N | unlink [ITEM]" >&2
+        exit 2 ;;
+esac

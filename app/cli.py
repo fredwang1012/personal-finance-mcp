@@ -23,7 +23,7 @@ def set_plaid_keys() -> int:
         print("Both values are required; nothing stored.", file=sys.stderr)
         return 1
     secrets.set_plaid_keys(settings.plaid_env, client_id, secret)
-    print(f"Stored Plaid keys for '{settings.plaid_env}' in the OS keychain.")
+    print(f"Stored Plaid keys for '{settings.plaid_env}' ({settings.secrets_backend} backend).")
     # enough to spot a failed paste without showing the secret: Plaid client ids are 24 characters, secrets 30
     print(f"Check: client_id ends in ...{client_id[-4:]} ({len(client_id)} characters); "
           f"secret has {len(secret)} characters.")
@@ -117,7 +117,7 @@ def _delete_locally(env: str, item_id: str, short: str, after_plaid: bool) -> in
         where = f"Item {short} removed at Plaid; local" if after_plaid else f"Item {short}: local"
         print(f"{where} cleanup failed ({type(exc).__name__}), run unlink again to finish.")
         return 1
-    print("Deleted its access token and list entry from the OS keychain.")
+    print(f"Deleted its access token and list entry (secrets backend: {settings.secrets_backend}).")
     return 0
 
 
