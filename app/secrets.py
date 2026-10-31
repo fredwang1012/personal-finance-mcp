@@ -95,8 +95,8 @@ def list_item_ids(env: str) -> list[str]:
         ids = None
     if not isinstance(ids, list):
         raise MissingSecret(
-            f"The stored list of linked items for '{env}' is corrupt. Run: {LINK_CMD} to link again "
-            f"(this replaces the list)."
+            f"The stored list of linked items for '{env}' is corrupt. Delete the keychain entry "
+            f"'linked_items_{env}' (service '{SERVICE}'), then run: {LINK_CMD}"
         ) from None
     return ids
 
