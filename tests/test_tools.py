@@ -931,3 +931,99 @@ def test_secret_split_by_zero_width_space_is_redacted(csv_conn):
     out2 = b.clean(f"{PID_TFSA[:5]}⁠{PID_TFSA[5:]}")
     assert "TOKENMARK" not in out and "CLIENTIDMARKER" not in out and "PLAIDACCTID" not in out2
     assert "​" not in out and out.startswith("a [redacted] b [redacted]")
+
+
+# ---- holding currency (institution labels US-listed positions CAD) -------------------------------------------
+
+US_NOTE = "US-listed holdings were reported as CAD"
+PID_WS = "PLAIDACCTID-ws-marker"
+
+
+@pytest.mark.parametrize("holding, security, account, expected", [
+    ({"iso_currency_code": "CAD"}, {"market_identifier_code": "XNAS", "iso_currency_code": "USD"}, None, ("USD", True)),
+    ({"iso_currency_code": "CAD"}, {"market_identifier_code": "arcx", "iso_currency_code": "USD"}, None, ("USD", True)),
+    ({"iso_currency_code": "CAD"}, {"market_identifier_code": "OOTC", "iso_currency_code": "USD"}, None, ("CAD", False)),
+    ({"iso_currency_code": "USD"}, {"market_identifier_code": "XNYS", "iso_currency_code": "USD"}, None, ("USD", False)),
+    ({"iso_currency_code": "CAD"}, {"iso_currency_code": "USD"}, None, ("CAD", False)),
+    ({"iso_currency_code": "CAD"}, {"market_identifier_code": "XTSE", "iso_currency_code": "CAD"}, None, ("CAD", False)),
+    ({"iso_currency_code": "CAD"}, {"market_identifier_code": "XNAS", "iso_currency_code": "CAD"}, None, ("CAD", False)),
+    ({}, {"iso_currency_code": "USD"}, "CAD", ("USD", False)),
+    ({}, {}, "CAD", ("CAD", False)),
+    ({}, {}, None, (None, False)),
+])
+def test_holding_currency(holding, security, account, expected):
+    assert tools.holding_currency(holding, security, account) == expected
+
+
+class MislabelledPlaid(FakePlaid):
+    """The observed Wealthsimple pattern with made-up numbers: every holding labelled CAD; US-exchange lines are
+    really priced in USD, OTC matches of TSX ETFs are really CAD. The balance is the institution's CAD total."""
+
+    SECURITIES = [
+        {"security_id": "u1", "name": "Made Up Corp", "ticker_symbol": "ZZUS", "type": "equity",
+         "market_identifier_code": "XNAS", "iso_currency_code": "USD", "close_price": 100.0},
+        {"security_id": "u2", "name": "Made Up US ETF", "ticker_symbol": "ZZUE", "type": "etf",
+         "market_identifier_code": "ARCX", "iso_currency_code": "USD", "close_price": 50.0},
+        {"security_id": "o1", "name": "Made Up TSX ETF", "ticker_symbol": "ZZOTF", "type": "etf",
+         "market_identifier_code": "OOTC", "iso_currency_code": "USD", "close_price": 20.0},
+    ]
+
+    def accounts_get(self, token):
+        return {"accounts": [_account(PID_WS, "TFSA", "tfsa", "7777", "CAD", 620)]}
+
+    def investments_holdings_get(self, token):
+        def h(sid, qty, price):
+            return {"account_id": PID_WS, "security_id": sid, "quantity": qty, "institution_price": price,
+                    "institution_value": qty * price, "cost_basis": qty * price - 10, "iso_currency_code": "CAD"}
+        return {"securities": self.SECURITIES, "holdings": [h("u1", 2, 100.5), h("u2", 1, 50.25), h("o1", 10, 27)]}
+
+    def investments_transactions_get(self, token, start, end):
+        txs = [{"account_id": PID_WS, "security_id": "u1", "date": date(2024, 1, 15), "name": "Buy", "amount": 201,
+                "type": "buy", "subtype": "buy", "iso_currency_code": "CAD"},
+               {"account_id": PID_WS, "security_id": "o1", "date": date(2024, 1, 16), "name": "Buy", "amount": 270,
+                "type": "buy", "subtype": "buy", "iso_currency_code": "CAD"}]
+        return {"investment_transactions": [t for t in txs if start <= t["date"] <= end],
+                "securities": self.SECURITIES}
+
+
+@pytest.fixture
+def mislabelled(tmp_path):
+    b = tools.Backend(store.connect(tmp_path / "w.db"), MislabelledPlaid(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    yield b
+    b.close()
+
+
+def test_us_listed_holdings_are_shown_in_usd_once_noted(mislabelled):
+    out = tools.holdings(mislabelled, detail="full")
+    by_symbol = {h["symbol"]: h for h in out["holdings"]}
+    assert {s: h["currency"] for s, h in by_symbol.items()} == {"ZZUS": "USD", "ZZUE": "USD", "ZZOTF": "CAD"}
+    assert by_symbol["ZZUS"]["cost_basis"] == "191.00" and by_symbol["ZZUS"]["price"] == "100.50"
+    assert out["summary"]["value"] == {"CAD": "270.00", "USD": "251.25"}
+    assert sum(US_NOTE in n for n in out["notes"]) == 1
+    assert any("Account balances are already in CAD" in n for n in out["notes"])
+
+
+def test_summary_never_adds_usd_holdings_into_cad(mislabelled):
+    out = tools.summary(mislabelled)
+    assert out["basis"] == "account_balances"
+    assert out["net_worth"] == "620.00"  # the institution's converted CAD balance, not a sum of holdings
+    cad, usd = out["by_currency"]["CAD"], out["by_currency"]["USD"]
+    assert {k: v["value"] for k, v in cad["by_security_type"].items()} == {"etf": "270.00"}
+    assert {k: (v["value"], v["pct"]) for k, v in usd["by_security_type"].items()} == {
+        "equity": ("201.00", "80.0"), "etf": ("50.25", "20.0")}
+    assert "net_worth" not in usd and "by_account_type" not in usd  # no USD balances, so no USD net worth
+    assert sum(US_NOTE in n for n in out["notes"]) == 1
+
+
+def test_investment_transactions_follow_the_security_exchange(mislabelled):
+    out = tools.transactions(mislabelled, 730, detail="full")
+    assert {t["symbol"]: t["currency"] for t in out["transactions"]} == {"ZZUS": "USD", "ZZOTF": "CAD"}
+    assert out["summary"]["totals"] == {"CAD": {"out": "-270.00"}, "USD": {"out": "-201.00"}}
+    assert sum(US_NOTE in n for n in out["notes"]) == 1
+
+
+def test_csv_and_correct_labels_get_no_currency_note(csv_only, backend):
+    for b in (csv_only, backend):
+        for out in all_outputs(b):
+            assert not any(US_NOTE in n for n in out.get("notes", []))
+    assert {h["currency"] for h in tools.holdings(csv_only)["holdings"]} == {"CAD"}

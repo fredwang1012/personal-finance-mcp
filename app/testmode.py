@@ -103,7 +103,8 @@ class HostilePlaid(FakePlaid):
     def investments_holdings_get(self, token):
         r = super().investments_holdings_get(token)
         r["securities"][0].update(ticker_symbol=f"FAKE{FAKE_TOKEN}", name=f"ETF fake-account {self.INJECT}",
-                                  type=f"etf; {self.INJECT}")
+                                  type=f"etf; {self.INJECT}", market_identifier_code=f"XNAS {FAKE_TOKEN}",
+                                  iso_currency_code="USD")
         return r
 
     def investments_transactions_get(self, token, start, end):

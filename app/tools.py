@@ -4,6 +4,8 @@ Rules every tool follows:
   * Rows carry `source` ("plaid" | "csv"); Plaid wins when both cover the same account (and date, for transactions).
   * Only needed fields are returned. Account ids are short local hashes, never Plaid ids, tokens or full numbers.
   * Money values are Decimal strings; currencies are never converted.
+  * A Plaid holding or investment transaction whose security trades on a US exchange in USD is shown in USD even when
+    the institution labels it otherwise (Wealthsimple labels every holding CAD); see holding_currency.
   * Plaid failures become short notes (code + display message); other sources still answer.
   * Output is compact: money rounded to cents, quantities to 6 decimals, empty fields dropped, free text shortened
     (after it has been sanitised) to CONCISE_TEXT or FULL_TEXT characters.
@@ -54,15 +56,21 @@ KEEP = {
     "investments_holdings_get": {
         "holdings": ("account_id", "security_id", "quantity", "institution_price", "institution_value", "cost_basis",
                      "iso_currency_code", "institution_price_as_of"),
-        "securities": ("security_id", "ticker_symbol", "name", "type", "iso_currency_code"),
+        "securities": ("security_id", "ticker_symbol", "name", "type", "iso_currency_code", "market_identifier_code"),
     },
     "investments_transactions_get": {
         "investment_transactions": ("account_id", "security_id", "date", "name", "amount", "type", "subtype",
                                     "iso_currency_code"),
-        "securities": ("security_id", "ticker_symbol"),
+        "securities": ("security_id", "ticker_symbol", "iso_currency_code", "market_identifier_code"),
     },
 }
 LIABILITY_TYPES = {"credit", "loan"}
+# ISO 10383 codes of US exchanges. A security listed on one of these in USD is priced in USD, whatever the holding's
+# label says. OTC (OOTC) is left out on purpose: Plaid matches TSX-listed ETFs to US OTC tickers, and those holdings
+# really are in the institution's currency.
+US_EXCHANGES = {"XNAS", "XNYS", "ARCX", "BATS", "XASE", "XNGS", "XNCM", "IEXG", "EDGX", "BATY"}
+US_LISTED_NOTE = ("Some US-listed holdings were reported as CAD by the institution; they are shown in USD based on "
+                  "their exchange. Account balances are already in CAD.")
 INVESTMENT_TYPES = {"buy", "sell", "dividend"}
 LINK_CMD = "python -m app.cli link"
 TOKEN_RE = re.compile(r"(?:access|link|public)-[a-z]+-[\w-]+")
@@ -123,6 +131,22 @@ def _currency(raw: Any, notes: list[str]) -> str | None:
         return str(raw)
     notes.append("Some rows had an invalid currency code; it is shown as '???'.")
     return "???"
+
+
+def holding_currency(holding: dict, security: dict, account_currency: str | None = None) -> tuple[str | None, bool]:
+    """(currency, corrected) for a Plaid holding or investment transaction.
+
+    Wealthsimple labels every holding CAD, yet the price and value of a US-listed security are in USD. So when the
+    security trades on a US exchange in USD and the row is labelled otherwise, the answer is ("USD", True). The rule is
+    the exchange, not a price ratio: Plaid's close prices for OTC matches are often wrong or stale. Otherwise the row's
+    own currency is kept, falling back to the security's, then the account's. Values are returned raw (unvalidated).
+    """
+    label = holding.get("iso_currency_code") or holding.get("unofficial_currency_code")
+    mic = str(security.get("market_identifier_code") or "").strip().upper()
+    sec_currency = str(security.get("iso_currency_code") or "").strip().upper()
+    if mic in US_EXCHANGES and sec_currency == "USD" and label != "USD":
+        return "USD", label is not None and label != ""
+    return label or security.get("iso_currency_code") or account_currency, False
 
 
 def _clamp(value: int, high: int, low: int = 1) -> int:
@@ -417,7 +441,7 @@ def _plaid_holdings(resp: dict, by_pid: dict[str, dict], clean: Callable[[str], 
             "symbol": _symbol(sec, clean) or "", "name": clean(sec.get("name") or ""),
             "quantity": _str(_dec(h.get("quantity"))), "price": _str(_dec(h.get("institution_price"))),
             "market_value": _str(_dec(h.get("institution_value"))), "cost_basis": _str(_dec(h.get("cost_basis"))),
-            "currency": _currency(h.get("iso_currency_code") or sec.get("iso_currency_code"), notes) or acct["currency"],
+            "currency": _row_currency(h, sec, acct, notes),
             "security_type": _security_type(sec.get("type")),
             "as_of": _date(h.get("institution_price_as_of")), "as_of_inferred": False,
             "source": "plaid",
@@ -441,12 +465,19 @@ def _plaid_transactions(
         rows.append({
             "date": _date(t.get("date")), "description": clean(t.get("name") or ""),
             "amount": _str(-amount if amount is not None else None),
-            "currency": _currency(t.get("iso_currency_code"), notes) or acct["currency"],
+            "currency": _row_currency(t, sec, acct, notes),
             "type": (plaid_type if plaid_type in PLAID_TX_TYPES else "other") if kind == "other" else kind,
             "symbol": _symbol(sec, clean),
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "source": "plaid",
         })
     return rows
+
+
+def _row_currency(row: dict, sec: dict, acct: dict, notes: list[str]) -> str | None:
+    currency, corrected = holding_currency(row, sec)
+    if corrected:
+        notes.append(US_LISTED_NOTE)  # deduplicated by _result, so it appears once per response
+    return _currency(currency, notes) or acct["currency"]
 
 
 def _minimise(endpoint: str, resp: Any) -> Any:
@@ -684,6 +715,13 @@ def transactions(backend: Backend, days: int = 90, account: str | None = None, s
 
 
 def summary(backend: Backend, currency: str = "CAD") -> dict:
+    """Net worth and allocation, totalled separately per currency; nothing is converted.
+
+    Net worth and by_account_type come from account balances only (basis "account_balances"): a Plaid balance is the
+    institution's own total, already in the account's currency, so holdings are never added to it. by_security_type
+    comes from holdings, grouped by each holding's currency (US-listed holdings in USD, see holding_currency). A
+    currency that only holdings use, such as USD inside a CAD account, therefore has an allocation but no net worth.
+    """
     notes = _start(backend)
     rows, _, csv_accts, match, plaid_held = backend._merged_accounts(notes, holdings=True)
     held = backend._holdings_from(csv_accts, match, plaid_held, notes)
@@ -713,7 +751,7 @@ def summary(backend: Backend, currency: str = "CAD") -> dict:
         return {k: {"value": _money(v), "pct": _pct(shares[k], total) if k in shares else None} for k, v in ordered}
 
     by_currency = {
-        cur: {"net_worth": _money(sum(net.get(cur, {}).values(), Decimal())),
+        cur: {"net_worth": _money(sum(net[cur].values(), Decimal())) if cur in net else None,
               "by_account_type": table(net.get(cur, {}), assets.get(cur, {})),
               "by_security_type": table(secs.get(cur, {}), secs.get(cur, {}))}
         for cur in sorted(set(net) | set(secs))
@@ -725,8 +763,8 @@ def summary(backend: Backend, currency: str = "CAD") -> dict:
     if len(by_currency) > 1:
         notes.append("Several currencies: each is totalled separately, percentages are within each currency, "
                      "nothing is converted.")
-    return _result(notes, currency=primary, net_worth=by_currency.get(primary, {}).get("net_worth", "0.00"),
-                   by_currency=by_currency)
+    return _result(notes, currency=primary, net_worth=by_currency.get(primary, {}).get("net_worth") or "0.00",
+                   basis="account_balances", by_currency=by_currency)
 
 
 def health(backend: Backend) -> dict:
