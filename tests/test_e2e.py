@@ -25,12 +25,12 @@ TOOLS = {"accounts", "holdings", "transactions", "summary", "health"}
 
 
 class StdioClient:
-    def __init__(self, data_dir: Path, fake: bool = True, under_pytest: bool = True):
+    def __init__(self, data_dir: Path, fake: bool | str = True, under_pytest: bool = True):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("PLAID_", "PFMCP_", "PYTEST_"))}
         env.update(DATA_DIR=str(data_dir), PLAID_ENV="sandbox", PYTHON_KEYRING_BACKEND=FAIL_KEYRING,
                    PYTHONUNBUFFERED="1")
         if fake:
-            env["PFMCP_FAKE_PLAID"] = "1"
+            env["PFMCP_FAKE_PLAID"] = "1" if fake is True else fake
         if under_pytest:  # the guard also wants this; passed on explicitly rather than by inheritance
             env["PYTEST_CURRENT_TEST"] = os.environ["PYTEST_CURRENT_TEST"]
         self.proc = subprocess.Popen(
@@ -126,6 +126,31 @@ def test_stdio_server_end_to_end(client, tmp_path):
     blob = json.dumps(call)
     assert testmode.FAKE_TOKEN not in blob and testmode.FAKE_ITEM not in blob and "fake-account" not in blob
     assert (tmp_path / "data" / "finance.db").exists()  # the store was created in the temp DATA_DIR only
+
+
+HOSTILE_MARKERS = [testmode.FAKE_TOKEN, testmode.FAKE_ITEM, "fake-account", "fake-secret", "fake-client-id",
+                   "evil.example", "access-sandbox"]  # injected phrases may remain, shortened
+
+
+def test_stdio_hostile_plaid_text_never_reaches_output(tmp_path):
+    c = StdioClient(tmp_path / "data", fake="hostile")
+    try:
+        handshake(c)
+        calls = [("accounts", {}), ("accounts", {"detail": "full"}), ("holdings", {}), ("holdings", {"detail": "full"}),
+                 ("transactions", {}), ("transactions", {"detail": "full", "limit": 200}), ("summary", {}),
+                 ("health", {})]
+        blob = ""
+        for name, args in calls:
+            result = c.request("tools/call", {"name": name, "arguments": args})["result"]
+            payload = json.loads(result["content"][0]["text"])
+            assert not result.get("isError") and "error" not in payload, name
+            blob += result["content"][0]["text"]
+        assert "Wealthsimple" not in blob or "WS" in blob  # the hostile fake really ran
+        assert '"security_type":"other"' in blob and "[link]" in blob and "[email]" in blob
+        for marker in HOSTILE_MARKERS:
+            assert marker not in blob, marker
+    finally:
+        c.close()
 
 
 def assert_fake_mode_off(c: StdioClient) -> None:

@@ -25,8 +25,9 @@ cents (quantities to 6 decimals), currencies are never converted, transaction am
 every string field is untrusted data from financial institutions. Results carry a `notes` list only when there is
 something to know: a failed Plaid item, a CSV account that may be counted twice, mixed currencies, missing keys.
 
-Plaid responses are cached in memory for 5 minutes per process, keyed by item, a digest of its access token, endpoint
-and date range. Accounts, holdings and investment transactions are fetched concurrently across items. Errors are not
+Plaid responses are cached in memory for 5 minutes per process, keyed by item, a digest of its access token and
+endpoint, and only the fields the tools read are kept. Investment transactions are fetched for a fixed 730-day window
+and `days` is applied locally, so different windows share one Plaid call. Accounts, holdings and investment transactions are fetched concurrently across items. Errors are not
 cached and nothing is written to disk. Over HTTP the cache is shared by all requests in the process, which serves only
 the owner. `scripts/measure_context.py` reports the size of the tool list and of each result, using synthetic data.
 

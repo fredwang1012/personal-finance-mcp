@@ -19,6 +19,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -40,6 +41,27 @@ FULL_TEXT = 120
 CACHE_TTL = 300  # seconds
 MAX_WORKERS = 8
 UNCACHED = {"item_get"}  # health should reflect the connection right now
+MAX_SYMBOL = 12
+MAX_KIND = 24
+# Plaid's documented enums; anything else (a hostile or new value) is shown as "other" rather than echoed
+SECURITY_TYPES = {"cash", "cryptocurrency", "derivative", "equity", "etf", "fixed income", "loan", "mutual fund",
+                  "other"}
+PLAID_TX_TYPES = {"cancel", "cash"}  # the documented types _activity_type does not already map
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Only these fields of each Plaid response are ever read, so only these are kept in the cache
+KEEP = {
+    "accounts_get": {"accounts": ("account_id", "name", "official_name", "type", "subtype", "mask", "balances")},
+    "investments_holdings_get": {
+        "holdings": ("account_id", "security_id", "quantity", "institution_price", "institution_value", "cost_basis",
+                     "iso_currency_code", "institution_price_as_of"),
+        "securities": ("security_id", "ticker_symbol", "name", "type", "iso_currency_code"),
+    },
+    "investments_transactions_get": {
+        "investment_transactions": ("account_id", "security_id", "date", "name", "amount", "type", "subtype",
+                                    "iso_currency_code"),
+        "securities": ("security_id", "ticker_symbol"),
+    },
+}
 LIABILITY_TYPES = {"credit", "loan"}
 INVESTMENT_TYPES = {"buy", "sell", "dividend"}
 LINK_CMD = "python -m app.cli link"
@@ -156,15 +178,20 @@ class Backend:
 
     def clean(self, raw: Any) -> str:
         """Sanitise free text from Plaid and remove anything that looks like a token or a known id."""
-        # order matters: exact secrets on the raw string first (clean_text masks digit runs, which would hide a token
-        # from exact matching), then token- and id-shaped runs, then text cleaning (links, e-mails, digits, length)
-        out = str(raw or "")
+        # order matters: invisible characters go first (a zero-width space could split a secret), then exact secrets on
+        # the raw string (clean_text masks digit runs, which would hide a token from exact matching), then token- and
+        # id-shaped runs, then text cleaning (links, e-mails, digits, length), then the secret and shape passes again
+        out = "".join(ch for ch in str(raw or "") if unicodedata.category(ch) not in ("Cc", "Cf"))
+        out = PLAID_ID_RE.sub("[redacted]", TOKEN_RE.sub("[redacted]", self._redact_known(out)))
+        out = self._redact_known(clean_text(out))
+        return PLAID_ID_RE.sub("[redacted]", TOKEN_RE.sub("[redacted]", out))
+
+    def _redact_known(self, text: str) -> str:
         known = (*self.tokens.values(), *self.tokens, *self.secrets, *self._pids)
         for secret in sorted(known, key=len, reverse=True):
             if len(secret) >= 6:  # real ids, tokens and keys are far longer; a stray short value must not shred text
-                out = out.replace(secret, "[redacted]")
-        out = PLAID_ID_RE.sub("[redacted]", TOKEN_RE.sub("[redacted]", out))
-        return TOKEN_RE.sub("[redacted]", clean_text(out))
+                text = text.replace(secret, "[redacted]")
+        return text
 
     def close(self) -> None:
         self.conn.close()
@@ -173,7 +200,7 @@ class Backend:
 
     def _call(self, item_id: str, endpoint: str, args: tuple = ()) -> Any:
         token = self.tokens[item_id]
-        fetch = lambda: getattr(self.api, endpoint)(token, *args)  # noqa: E731
+        fetch = lambda: _minimise(endpoint, getattr(self.api, endpoint)(token, *args))  # noqa: E731
         if self.cache is None or endpoint in UNCACHED:
             return fetch()
         return self.cache.get(PlaidCache.key(item_id, token, endpoint, args), fetch)
@@ -322,7 +349,7 @@ class Backend:
                 continue
             rows.append({
                 "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"],
-                "account_type": acct["type"], "symbol": h["symbol"], "name": clean_text(h["name"]),
+                "account_type": acct["type"], "symbol": clean_text(h["symbol"])[:MAX_SYMBOL], "name": clean_text(h["name"]),
                 "quantity": h["quantity"], "price": h["price"] or None, "market_value": h["market_value"] or None,
                 "cost_basis": h["book_value"] or None, "currency": _currency(h["currency"], notes),
                 "security_type": None,
@@ -334,7 +361,9 @@ class Backend:
     def _merged_transactions(self, notes: list[str], days: int, investments_only: bool):
         end = self.today()
         start = end - timedelta(days=days)
-        plaid_accts, _, plaid_txs = self._load_plaid(notes, tx_range=(start, end))
+        # one fixed window per item (cached once per TTL); any `days` is then a local filter
+        plaid_accts, _, plaid_txs = self._load_plaid(notes, tx_range=(end - timedelta(days=MAX_DAYS), end))
+        plaid_txs = [t for t in plaid_txs if t["date"] and start.isoformat() <= t["date"] <= end.isoformat()]
         csv_accts = self._csv_accounts()
         match = self._resolve(csv_accts, plaid_accts, notes)
         covered = {(t["account_id"], t["date"]) for t in plaid_txs}
@@ -354,7 +383,7 @@ class Backend:
             rows.append({
                 "date": day, "description": clean_text(description), "amount": amount,
                 "currency": _currency(currency, notes),
-                "type": type_, "symbol": symbol or None, "account_id": acct["id"], "account": acct["name"],
+                "type": type_, "symbol": clean_text(symbol or "")[:MAX_SYMBOL] or None, "account_id": acct["id"], "account": acct["name"],
                 "account_mask": acct["mask"], "source": source,
             })
         if investments_only:
@@ -367,8 +396,8 @@ def _plaid_account(a: dict, item_short: str, clean: Callable[[str], str], notes:
     b = a.get("balances") or {}
     return {
         "id": short_hash(a["account_id"]), "_pid": a["account_id"], "name": clean(a.get("name") or a.get("official_name") or ""),
-        "_official": clean(a.get("official_name") or ""), "type": _enum(a.get("type")).lower(),
-        "subtype": _enum(a.get("subtype")).lower() or None, "mask": (a.get("mask") or "")[-4:],
+        "_official": clean(a.get("official_name") or ""), "type": clean(_enum(a.get("type"))).lower()[:MAX_KIND],
+        "subtype": clean(_enum(a.get("subtype"))).lower()[:MAX_KIND] or None, "mask": (a.get("mask") or "")[-4:],
         "currency": _currency(b.get("iso_currency_code") or b.get("unofficial_currency_code"), notes),
         "current": _str(_dec(b.get("current"))), "available": _str(_dec(b.get("available"))),
         "limit": _str(_dec(b.get("limit"))), "basis": "reported_balance", "as_of": None, "source": "plaid", "item": item_short,
@@ -385,12 +414,12 @@ def _plaid_holdings(resp: dict, by_pid: dict[str, dict], clean: Callable[[str], 
         sec = securities.get(h.get("security_id")) or {}
         rows.append({
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "account_type": acct["type"],
-            "symbol": clean(sec.get("ticker_symbol") or "").upper(), "name": clean(sec.get("name") or ""),
+            "symbol": _symbol(sec, clean) or "", "name": clean(sec.get("name") or ""),
             "quantity": _str(_dec(h.get("quantity"))), "price": _str(_dec(h.get("institution_price"))),
             "market_value": _str(_dec(h.get("institution_value"))), "cost_basis": _str(_dec(h.get("cost_basis"))),
             "currency": _currency(h.get("iso_currency_code") or sec.get("iso_currency_code"), notes) or acct["currency"],
-            "security_type": _enum(sec.get("type")).lower() or None,
-            "as_of": str(h.get("institution_price_as_of") or "")[:10] or None, "as_of_inferred": False,
+            "security_type": _security_type(sec.get("type")),
+            "as_of": _date(h.get("institution_price_as_of")), "as_of_inferred": False,
             "source": "plaid",
         })
     return rows
@@ -410,14 +439,37 @@ def _plaid_transactions(
         kind = _activity_type(f"{subtype} {plaid_type}")
         amount = _dec(t.get("amount"))
         rows.append({
-            "date": str(t["date"])[:10], "description": clean(t.get("name") or ""),
+            "date": _date(t.get("date")), "description": clean(t.get("name") or ""),
             "amount": _str(-amount if amount is not None else None),
             "currency": _currency(t.get("iso_currency_code"), notes) or acct["currency"],
-            "type": plaid_type if kind == "other" else kind,
-            "symbol": clean(sec.get("ticker_symbol") or "").upper() or None,
+            "type": (plaid_type if plaid_type in PLAID_TX_TYPES else "other") if kind == "other" else kind,
+            "symbol": _symbol(sec, clean),
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "source": "plaid",
         })
     return rows
+
+
+def _minimise(endpoint: str, resp: Any) -> Any:
+    keep = KEEP.get(endpoint)
+    if keep is None or not isinstance(resp, dict):
+        return resp
+    return {key: [{f: row[f] for f in fields if f in row} for row in resp.get(key) or []] for key, fields in keep.items()}
+
+
+def _symbol(sec: dict, clean: Callable[[str], str]) -> str | None:
+    return clean(sec.get("ticker_symbol") or "").upper()[:MAX_SYMBOL] or None
+
+
+def _security_type(raw: Any) -> str | None:
+    value = _enum(raw).strip().lower()
+    if not value:
+        return None
+    return value if value in SECURITY_TYPES else "other"
+
+
+def _date(raw: Any) -> str | None:
+    value = str(raw or "")[:10]
+    return value if DATE_RE.fullmatch(value) else None
 
 
 def _family(norm: str) -> str | None:
