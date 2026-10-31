@@ -15,6 +15,16 @@ class Settings(BaseSettings):
     data_dir: Path = ROOT / "data"
     country_codes: list[str] = ["CA"]
 
+    # where secrets live: the OS keychain (default) or systemd credentials on a headless server (see app/secrets.py)
+    secrets_backend: Literal["keyring", "systemd"] = "keyring"
+    credstore_dir: Path = Path("/etc/credstore.encrypted/personal-finance-mcp")
+
+    # remote connector (python -m app.cli serve-http); none of these is secret
+    public_url: str = ""  # e.g. https://vm.tailnet.ts.net ; the MCP endpoint is this plus /mcp
+    http_port: int = 8765
+    github_client_id: str = ""
+    github_allowed_user_id: int = 0  # numeric GitHub user id, not the login name
+
     @field_validator("data_dir")
     @classmethod
     def _anchor_to_root(cls, v: Path) -> Path:

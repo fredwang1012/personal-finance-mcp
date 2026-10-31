@@ -1,4 +1,4 @@
-"""Read-only MCP server over stdio: python -m app.server.
+"""Read-only MCP server over stdio: python -m app.server. The same tools are served over HTTP by app.remote.
 
 Startup touches neither the network nor the keychain; credentials are read lazily on the first tool call.
 PFMCP_FAKE_PLAID=1 is a test-only switch with a guard; see app/testmode.py.
@@ -37,7 +37,16 @@ def _real_plaid(s):
 
 plaid_factory: Callable = _real_plaid  # replaced only by the guarded test mode in main()
 
-mcp = MCPServer("personal-finance-mcp", instructions="Read-only view of the owner's Wealthsimple accounts. " + CONVENTIONS)
+INSTRUCTIONS = "Read-only view of the owner's Wealthsimple accounts. " + CONVENTIONS
+TOOLS: list[tuple[Callable, str]] = []  # (function, description), registered on every server built by build_server
+
+
+def _tool(description: str):
+    def register(fn: Callable) -> Callable:
+        TOOLS.append((fn, description))
+        return fn
+
+    return register
 
 
 def open_backend() -> tools.Backend:
@@ -87,55 +96,65 @@ def _run(fn: Callable, *args) -> dict:
         backend.close()
 
 
-@mcp.tool(description="List all accounts with name, type, subtype, mask (last 4), currency and balances. " + CONVENTIONS, annotations=READ_ONLY)
+@_tool("List all accounts with name, type, subtype, mask (last 4), currency and balances. " + CONVENTIONS)
 def list_accounts() -> dict:
     return _run(tools.list_accounts)
 
 
-@mcp.tool(description="Current balances per account and currency. CSV-only accounts show the market value of their latest holdings snapshot. " + CONVENTIONS, annotations=READ_ONLY)
+@_tool("Current balances per account and currency. CSV-only accounts show the market value of their latest holdings snapshot. " + CONVENTIONS)
 def get_balances() -> dict:
     return _run(tools.get_balances)
 
 
-@mcp.tool(
+@_tool(
     description=f"Holdings with symbol, name, quantity, price, market value, cost basis and currency (up to {tools.MAX_HOLDINGS} rows). "
-    "Optionally filter by account (local id, mask or name). " + CONVENTIONS,
-    annotations=READ_ONLY,
+    "Optionally filter by account (local id, mask or name). " + CONVENTIONS
 )
 def get_holdings(account: str | None = None) -> dict:
     return _run(tools.get_holdings, account)
 
 
-@mcp.tool(description="Recent transactions (investment activity from Plaid plus CSV imports). " + CONVENTIONS + TX_CONVENTIONS, annotations=READ_ONLY)
+@_tool("Recent transactions (investment activity from Plaid plus CSV imports). " + CONVENTIONS + TX_CONVENTIONS)
 def get_transactions(days: int = 90, limit: int = 100) -> dict:
     return _run(tools.get_transactions, days, limit)
 
 
-@mcp.tool(description="Recent investment transactions only (trades, dividends, anything with a symbol). " + CONVENTIONS + TX_CONVENTIONS, annotations=READ_ONLY)
+@_tool("Recent investment transactions only (trades, dividends, anything with a symbol). " + CONVENTIONS + TX_CONVENTIONS)
 def get_investment_transactions(days: int = 90, limit: int = 100) -> dict:
     return _run(tools.get_investment_transactions, days, limit)
 
 
-@mcp.tool(
+@_tool(
     description="Net worth totals by account type, reported separately for each currency (no conversion); "
-    "'primary_total' is the total in the requested currency (default CAD). " + CONVENTIONS,
-    annotations=READ_ONLY,
+    "'primary_total' is the total in the requested currency (default CAD). " + CONVENTIONS
 )
 def net_worth(currency: str = "CAD") -> dict:
     return _run(tools.net_worth, currency)
 
 
-@mcp.tool(description="Allocation percentages by account type and by security type, computed within each currency. " + CONVENTIONS, annotations=READ_ONLY)
+@_tool("Allocation percentages by account type and by security type, computed within each currency. " + CONVENTIONS)
 def allocation() -> dict:
     return _run(tools.allocation)
 
 
-@mcp.tool(description="Health of each linked Plaid item: institution, products, last successful update and error code.", annotations=READ_ONLY)
+@_tool("Health of each linked Plaid item: institution, products, last successful update and error code.")
 def item_health() -> dict:
     return _run(tools.item_health)
 
 
-def main() -> None:
+def build_server(**kwargs) -> MCPServer:
+    """A server with every tool registered read-only; kwargs (auth, middleware, ...) go to MCPServer."""
+    server = MCPServer("personal-finance-mcp", instructions=INSTRUCTIONS, **kwargs)
+    for fn, description in TOOLS:
+        server.tool(description=description, annotations=READ_ONLY)(fn)
+    return server
+
+
+mcp = build_server()
+
+
+def install_test_mode() -> None:
+    """Honour PFMCP_FAKE_PLAID only inside pytest's temp tree (see app/testmode.py)."""
     global plaid_factory
     if os.environ.get("PFMCP_FAKE_PLAID"):
         from app import testmode
@@ -145,6 +164,10 @@ def main() -> None:
             plaid_factory = testmode.FakePlaid
         else:  # stdout carries the protocol, so the warning goes to stderr
             print("PFMCP_FAKE_PLAID ignored: not running under pytest with a pytest temp DATA_DIR.", file=sys.stderr)
+
+
+def main() -> None:
+    install_test_mode()
     mcp.run("stdio")
 
 
