@@ -1,9 +1,13 @@
 import json
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 
 import pytest
+
+import keyring
 
 from app import link, secrets
 from app.plaid_client import PRODUCTS, PlaidError
@@ -36,8 +40,11 @@ def helper():
         thread.join(5)
 
 
-def request(server, path="/exchange", body=None, host=None, content_type="application/json", method="POST"):
+def request(server, path="/exchange", body=None, host=None, content_type="application/json", method="POST",
+            origin=None):
     headers = {"Host": host or f"127.0.0.1:{server.port}"}
+    if origin is not None:
+        headers["Origin"] = origin
     if content_type:
         headers["Content-Type"] = content_type
     data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
@@ -166,3 +173,86 @@ def test_run_link_times_out_with_failure_code():
     opened = []
     code = link.run_link(FakePlaid(), "sandbox", open_browser=opened.append, timeout=0.2)
     assert code == 1 and len(opened) == 1 and opened[0].startswith("http://127.0.0.1:")
+
+
+def test_origin_checks(helper):
+    server, fake, _ = helper
+    body = {"state": server.state, "public_token": "p"}
+    assert request(server, body=body, origin="http://evil.example")[0] == 403
+    assert request(server, body=body, origin="null")[0] == 403
+    assert fake.exchanged == []
+    assert request(server, body=body, origin=f"http://127.0.0.1:{server.port}")[0] == 200
+
+
+def test_oversize_body_rejected(helper):
+    server, fake, _ = helper
+    big = {"state": server.state, "public_token": "p" * (link._MAX_BODY + 1)}
+    assert request(server, body=big)[0] == 400
+    assert fake.exchanged == []
+
+
+def test_host_header_is_case_insensitive(helper):
+    server, _, _ = helper
+    assert request(server, "/", method="GET", content_type=None, host=f"LocalHost:{server.port}")[0] == 200
+
+
+def test_page_has_csp_allowing_only_plaid(helper):
+    server, _, _ = helper
+    req = urllib.request.Request(server.url, headers={"Host": f"127.0.0.1:{server.port}"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        csp = resp.headers["Content-Security-Policy"]
+    assert "default-src 'none'" in csp and "https://cdn.plaid.com" in csp
+
+
+def test_idle_socket_does_not_stall_server(helper):
+    server, fake, thread = helper
+    idle = socket.create_connection(("127.0.0.1", server.port))
+    try:
+        assert request(server, "/", method="GET", content_type=None)[0] == 200
+        started = time.monotonic()
+        server.shutdown()
+        thread.join(5)
+        assert not thread.is_alive() and time.monotonic() - started < 3
+    finally:
+        idle.close()
+
+
+def test_timeout_with_idle_socket_still_stops():
+    server = link.LinkServer(FakePlaid(), "sandbox", "t")
+    idle = socket.create_connection(("127.0.0.1", server.port))
+    thread = threading.Thread(target=server.run, args=(0.3,), daemon=True)
+    thread.start()
+    thread.join(5)
+    idle.close()
+    assert not thread.is_alive()
+
+
+def test_keychain_failure_removes_orphaned_item(helper, monkeypatch, capsys):
+    server, fake, thread = helper
+    removed = []
+    fake.item_remove = removed.append
+
+    def broken(*_a, **_k):
+        raise keyring.errors.KeyringError("locked")
+
+    monkeypatch.setattr(secrets, "set_access_token", broken)
+    status, _ = request(server, body={"state": server.state, "public_token": "p"})
+    assert status == 500
+    assert removed == ["access-sandbox-fake"]
+    out = capsys.readouterr().out
+    assert "item-1" in out and "access-sandbox-fake" not in out
+    assert server.item_id is None
+    thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_fixed_port_still_binds_loopback():
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    server = link.LinkServer(FakePlaid(), "sandbox", "t", port)
+    try:
+        assert server.server_address == ("127.0.0.1", port)
+    finally:
+        server.server_close()

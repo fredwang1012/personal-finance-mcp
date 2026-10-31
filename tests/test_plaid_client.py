@@ -19,7 +19,7 @@ def test_api_exception_maps_to_plaid_error_without_secrets():
     )
     real = make_real()
 
-    def boom(_request):
+    def boom(_request, **_kwargs):
         raise exc
 
     with pytest.raises(PlaidError) as caught:
@@ -41,7 +41,7 @@ def test_link_token_request_shape():
     real = make_real()
     captured = {}
 
-    def fake_create(request):
+    def fake_create(request, **_kwargs):
         captured["req"] = request
         return {"link_token": "link-abc"}
 
@@ -59,3 +59,16 @@ def test_link_token_request_shape():
 def test_interface_has_no_money_movement():
     names = {n for n in dir(RealPlaid) if not n.startswith("_")}
     assert not {n for n in names if any(w in n for w in ("transfer", "payment", "auth", "sweep", "investments_move"))}
+
+
+def test_every_call_has_a_request_timeout():
+    real = make_real()
+    seen = {}
+
+    def spy(request, **kwargs):
+        seen.update(kwargs)
+        return {}
+
+    real._call(spy, object())
+    assert seen == {"_request_timeout": plaid_client.REQUEST_TIMEOUT}
+    assert 0 < plaid_client.REQUEST_TIMEOUT <= 30

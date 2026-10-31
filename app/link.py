@@ -8,7 +8,7 @@ import json
 import secrets as pysecrets
 import threading
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from app import secrets
@@ -17,6 +17,16 @@ from app.plaid_client import PlaidAPI, PlaidError
 PAGE = Path(__file__).parent / "static" / "link.html"
 TIMEOUT_SECONDS = 600
 _MAX_BODY = 8192
+# What Plaid Link needs: its script and iframe from cdn.plaid.com, and calls to *.plaid.com
+CSP = (
+    "default-src 'none'; script-src 'self' https://cdn.plaid.com 'unsafe-inline'; "
+    "connect-src 'self' https://*.plaid.com; frame-src https://cdn.plaid.com https://*.plaid.com; "
+    "style-src 'unsafe-inline'; img-src https://*.plaid.com data:"
+)
+
+
+class StoreError(RuntimeError):
+    """The keychain write failed after Plaid issued a token."""
 
 
 def confirm_production(env: str, input_fn=input) -> bool:
@@ -27,12 +37,14 @@ def confirm_production(env: str, input_fn=input) -> bool:
         "WARNING: you are linking in PRODUCTION. Each linked Item permanently uses one of the 10 "
         "Trial plan slots, even if you remove it later."
     )
-    return input_fn("Type exactly 'yes' to continue: ") == "yes"
+    return input_fn('Type exactly "yes" (lowercase, nothing else) to continue: ') == "yes"
 
 
-class LinkServer(HTTPServer):
-    def __init__(self, plaid: PlaidAPI, env: str, link_token: str):
-        super().__init__(("127.0.0.1", 0), _Handler)
+class LinkServer(ThreadingHTTPServer):
+    daemon_threads = True  # an idle connection must never keep the process or shutdown waiting
+
+    def __init__(self, plaid: PlaidAPI, env: str, link_token: str, port: int = 0):
+        super().__init__(("127.0.0.1", port), _Handler)
         self.plaid = plaid
         self.env = env
         self.link_token = link_token
@@ -74,7 +86,16 @@ class LinkServer(HTTPServer):
             if self._exchanged:
                 raise PermissionError("already exchanged")
             access_token, item_id = self.plaid.exchange_public_token(public_token)
-            secrets.set_access_token(self.env, item_id, access_token)
+            try:
+                secrets.set_access_token(self.env, item_id, access_token)
+            except Exception:
+                # Without a stored token the Item is orphaned (and burns a Trial slot), so release it
+                print(f"WARNING: could not store the token for item {item_id} in the keychain.")
+                try:
+                    self.plaid.item_remove(access_token)
+                except Exception:
+                    print(f"WARNING: could not remove item {item_id} from Plaid either; remove it in the Plaid dashboard.")
+                raise StoreError(item_id) from None
             self._exchanged = True
             self.item_id = item_id
         return item_id
@@ -82,6 +103,7 @@ class LinkServer(HTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server: LinkServer
+    timeout = 5  # seconds a connection may sit idle before its thread gives up
 
     def log_message(self, format, *args):  # noqa: A002 - silence default request logging
         pass
@@ -91,13 +113,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(body)
 
     def _host_ok(self) -> bool:
-        return self.headers.get("Host") in self.server.allowed_hosts()
+        return (self.headers.get("Host") or "").lower() in self.server.allowed_hosts()
 
     def do_GET(self):
         if not self._host_ok():
@@ -135,20 +158,23 @@ class _Handler(BaseHTTPRequestHandler):
             item_id = self.server.exchange(public_token)
         except PermissionError:
             return self._send(409, b"already linked")
+        except StoreError:
+            self.server.stop_soon()
+            return self._send(500, b"could not store token")
         except PlaidError as exc:
             print(f"Plaid rejected the link: {exc.code}")
             return self._send(502, b"exchange failed")
         print(f"Linked item {item_id}. Token stored in the OS keychain.")
+        self.server.stop_soon()  # before replying, so a broken pipe cannot keep the helper alive
         self._send(200, b'{"ok": true}', "application/json")
-        self.server.stop_soon()
 
 
 def run_link(plaid: PlaidAPI, env: str, input_fn=input, open_browser=webbrowser.open,
-             timeout: float = TIMEOUT_SECONDS) -> int:
+             timeout: float = TIMEOUT_SECONDS, port: int = 0) -> int:
     if not confirm_production(env, input_fn):
         print("Cancelled; nothing linked.")
         return 1
-    server = LinkServer(plaid, env, plaid.create_link_token())
+    server = LinkServer(plaid, env, plaid.create_link_token(), port)
     print(f"Opening {server.url} (expires in {int(timeout // 60)} minutes). Complete the link in your browser.")
     open_browser(server.url)
     item_id = server.run(timeout)

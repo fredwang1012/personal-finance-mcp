@@ -25,6 +25,7 @@ PRODUCTS = ["investments", "transactions"]
 CLIENT_NAME = "personal-finance-mcp"
 LOCAL_USER_ID = "owner"
 _PAGE = 500
+REQUEST_TIMEOUT = 30  # seconds, passed to every Plaid call
 
 
 class PlaidError(Exception):
@@ -77,7 +78,7 @@ class RealPlaid:
 
     def _call(self, method, request):
         try:
-            return method(request)
+            return method(request, _request_timeout=REQUEST_TIMEOUT)
         except plaid.ApiException as exc:
             raise _translate(exc) from None  # `from None` drops the original, whose text can include the body
 

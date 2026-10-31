@@ -28,12 +28,12 @@ def status() -> int:
     return 0
 
 
-def link() -> int:
+def link(port: int = 0) -> int:
     from app.link import run_link
     from app.plaid_client import PlaidError, RealPlaid
 
     try:
-        return run_link(RealPlaid.from_settings(settings), settings.plaid_env)
+        return run_link(RealPlaid.from_settings(settings), settings.plaid_env, port=port)
     except (secrets.MissingSecret, PlaidError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -44,9 +44,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("set-plaid-keys", help="prompt for Plaid client_id and secret and store them in the keychain")
     sub.add_parser("status", help="show environment, whether keys exist, and linked item count")
-    sub.add_parser("link", help="open Plaid Link in your browser to link Wealthsimple")
+    link_parser = sub.add_parser("link", help="open Plaid Link in your browser to link Wealthsimple")
+    link_parser.add_argument(
+        "--port", type=int, default=0, help="fixed port on 127.0.0.1 (default 0 = ephemeral), e.g. for an SSH port-forward"
+    )
     args = parser.parse_args(argv)
-    return {"set-plaid-keys": set_plaid_keys, "status": status, "link": link}[args.command]()
+    if args.command == "link":
+        return link(args.port)
+    return {"set-plaid-keys": set_plaid_keys, "status": status}[args.command]()
 
 
 if __name__ == "__main__":
