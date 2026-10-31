@@ -69,7 +69,8 @@ TYPE_RES = [
 ]
 DIGIT_RUN = re.compile(r"\d(?:[ -]?\d){5,}")
 NUMBER_LIKE = re.compile(r"[\d \-]{6,}")
-IDENTIFIER_LIKE = re.compile(r"[A-Z0-9\-]{6,}")  # no spaces, no lower case: e.g. "AB-77-XYZ12"
+IDENTIFIER_LIKE = re.compile(r"[A-Za-z0-9\-]{6,}")  # no spaces, e.g. "AB-77-XYZ12"
+LABEL_LIKE = re.compile(r"[A-Za-z]{3,}(?:-?\d{1,4}){1,2}")  # e.g. "RRSP-2024-01", "TFSA2024"
 NUMERIC = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 
 
@@ -191,13 +192,19 @@ def _hash(*parts: str) -> str:
 def _looks_like_number(text: str) -> bool:
     if NUMBER_LIKE.fullmatch(text):
         return True
-    # alphanumeric identifiers need several digits, so plain upper-case names such as "NON-REGISTERED" stay names
-    return bool(IDENTIFIER_LIKE.fullmatch(text)) and sum(ch.isdigit() for ch in text) >= 4
+    # An alphanumeric identifier needs at least 4 digits, so plain names ("NON-REGISTERED") stay names. A word of 3+
+    # letters followed by one or two short digit groups ("RRSP-2024-01") is a label, not a number; account numbers
+    # either start with at most 2 letters or carry a digit run longer than 4.
+    if not IDENTIFIER_LIKE.fullmatch(text) or sum(ch.isdigit() for ch in text) < 4:
+        return False
+    return not LABEL_LIKE.fullmatch(text)
 
 
-def _add(a: str, b: str) -> str:
+def _add(a: str, b: str, label: str = "") -> str:
     if not a and not b:
         return ""
+    if label and not (a and b):
+        raise RowError(f"cannot combine lots: {label} missing in one of them")
     total = Decimal(a or 0) + Decimal(b or 0)
     return "0" if total == 0 else format(total.normalize(), "f")
 
@@ -214,7 +221,7 @@ def _account(row: dict[str, str]) -> tuple[str, str, str, str, str]:
     if not (name or type_ or mask):
         raise RowError("missing account")
     # the id derives from non-secret fields only, so the full number never reaches the store
-    return _hash("csv-account", name, type_, mask)[:16], name or type_, type_, mask, number
+    return _hash("csv-account", name or type_, type_, mask)[:16], name or type_, type_, mask, number
 
 
 def _decode(raw: bytes) -> str:
@@ -274,6 +281,7 @@ def import_file(path: Path, conn, now: datetime | None = None) -> ImportResult:
                 _import_row(conn, kind, dict(zip(headers, values)), seen, held, result, file_sha, imported_at, now)
             except RowError as exc:
                 result.rejected.append((line, str(exc)))
+        _flush_holdings(conn, held, result, file_sha, imported_at)
     except csv.Error:
         conn.rollback()
         raise ValueError("malformed CSV (e.g. a cell larger than the parser limit)") from None
@@ -332,37 +340,39 @@ def _import_row(conn, kind, row, seen, held, result, file_sha, imported_at, now)
     previous = held.get(key)
     if previous:
         # a second lot of the same position in one file: combine rather than overwrite
-        if previous[5] != currency:
+        prev = previous[2]
+        if prev[5] != currency:
             raise RowError("same position listed in different currencies")
-        values = (previous[0], _add(previous[1], values[1]), previous[2], _add(previous[3], values[3]),
-                  _add(previous[4], values[4]), currency)
+        values = (prev[0], _add(prev[1], values[1]), prev[2], _add(prev[3], values[3], "market value"),
+                  _add(prev[4], values[4], "book value"), currency)
         result.merged += 1
-    held[key] = values
     _save_account(conn, account, imported_at, file_sha)
-    existing = conn.execute(
-        "SELECT name, quantity, price, market_value, book_value, currency FROM holdings"
-        " WHERE account_id=? AND as_of=? AND symbol=?",
-        (account[0], as_of, symbol),
-    ).fetchone()
-    if existing == values:
-        result.duplicates += 1
-        return
-    merged_row = previous is not None
-    conn.execute(
-        "INSERT INTO holdings (account_id, as_of, as_of_inferred, symbol, name, quantity, price, market_value,"
-        " book_value, currency, source, imported_at, file_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,'csv',?,?)"
-        " ON CONFLICT (account_id, as_of, symbol) DO UPDATE SET as_of_inferred=excluded.as_of_inferred,"
-        " name=excluded.name, quantity=excluded.quantity, price=excluded.price, market_value=excluded.market_value,"
-        " book_value=excluded.book_value, currency=excluded.currency, source='csv',"
-        " imported_at=excluded.imported_at, file_sha256=excluded.file_sha256",
-        (account[0], as_of, 0 if as_of_raw else 1, symbol, *values, imported_at, file_sha),
-    )
-    if merged_row:
-        pass  # already counted when the first lot was written
-    elif existing:
-        result.updated += 1
-    else:
-        result.added += 1
+    held[key] = (account[0], 0 if as_of_raw else 1, values, as_of, symbol)  # written once, after the whole file
+
+
+def _flush_holdings(conn, held, result, file_sha: str, imported_at: str) -> None:
+    for account_id, inferred, values, as_of, symbol in held.values():
+        existing = conn.execute(
+            "SELECT name, quantity, price, market_value, book_value, currency FROM holdings"
+            " WHERE account_id=? AND as_of=? AND symbol=?",
+            (account_id, as_of, symbol),
+        ).fetchone()
+        if existing == values:
+            result.duplicates += 1
+            continue
+        conn.execute(
+            "INSERT INTO holdings (account_id, as_of, as_of_inferred, symbol, name, quantity, price, market_value,"
+            " book_value, currency, source, imported_at, file_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,'csv',?,?)"
+            " ON CONFLICT (account_id, as_of, symbol) DO UPDATE SET as_of_inferred=excluded.as_of_inferred,"
+            " name=excluded.name, quantity=excluded.quantity, price=excluded.price, market_value=excluded.market_value,"
+            " book_value=excluded.book_value, currency=excluded.currency, source='csv',"
+            " imported_at=excluded.imported_at, file_sha256=excluded.file_sha256",
+            (account_id, as_of, inferred, symbol, *values, imported_at, file_sha),
+        )
+        if existing:
+            result.updated += 1
+        else:
+            result.added += 1
 
 
 def _save_account(conn, account, imported_at: str, file_sha: str) -> None:

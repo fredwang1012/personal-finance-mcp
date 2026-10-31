@@ -70,7 +70,10 @@ class FakePlaid:
 def csv_conn(tmp_path):
     conn = store.connect(tmp_path / "t.db")
     csvimport.import_file(FIX / "activities_synthetic.csv", conn)
-    csvimport.import_file(FIX / "holdings_synthetic.csv", conn)
+    # same CSV account as the activities file (name, type and mask), so the two files describe one account
+    holdings = tmp_path / "holdings.csv"
+    holdings.write_text((FIX / "holdings_synthetic.csv").read_text().replace("Fake TFSA", "TFSA"))
+    csvimport.import_file(holdings, conn)
     yield conn
     conn.close()
 
@@ -92,7 +95,8 @@ def all_outputs(b):
 
 def test_list_accounts_shape_and_merge(backend):
     out = tools.list_accounts(backend)
-    assert out["notes"] == []
+    assert [n for n in out["notes"] if "Possible double count" in n and "Non-registered" in n]
+    assert not [n for n in out["notes"] if "TFSA" in n and "double" in n]
     by_name = {a["name"]: a for a in out["accounts"]}
     assert set(by_name["TFSA"]) == {"id", "name", "type", "subtype", "mask", "currency", "source", "balances"}
     assert by_name["TFSA"]["source"] == "plaid" and by_name["TFSA"]["balances"]["current"] == "1000.5"
@@ -175,7 +179,7 @@ def test_allocation_percentages(backend):
 
 def test_csv_only_mode(csv_only):
     accounts = tools.list_accounts(csv_only)
-    assert accounts["notes"] == ["No linked Plaid items; showing CSV data only."]
+    assert accounts["notes"][0] == "No linked Plaid items; showing CSV data only."
     assert {a["source"] for a in accounts["accounts"]} == {"csv"}
     assert {t["source"] for t in tools.get_transactions(csv_only, 730)["transactions"]} == {"csv"}
     assert {h["symbol"] for h in tools.get_holdings(csv_only)["holdings"]} == {"ZZTEST", "ZZCOIN"}
@@ -196,7 +200,7 @@ def test_one_failing_item_still_returns_other_sources(csv_conn):
 def test_only_failing_item_falls_back_to_csv(csv_conn):
     b = tools.Backend(csv_conn, FakePlaid(), {ITEM_BAD: TOKEN_BAD}, today=lambda: TODAY)
     out = tools.list_accounts(b)
-    assert {a["source"] for a in out["accounts"]} == {"csv"} and len(out["notes"]) == 1
+    assert {a["source"] for a in out["accounts"]} == {"csv"} and "ITEM_LOGIN_REQUIRED" in out["notes"][0]
 
 
 def test_item_health_shape(backend):
@@ -232,6 +236,8 @@ def test_tools_registered_read_only():
         a = t.annotations
         assert (a.read_only_hint, a.destructive_hint, a.idempotent_hint, a.open_world_hint) == (True, False, True, False)
         assert t.description
+    held = next(t for t in listed if t.name == "get_holdings")
+    assert "security_type" in held.description and "Bank" in held.description
 
 
 def test_open_backend_without_keys_is_csv_only(monkeypatch, tmp_path):
@@ -255,3 +261,130 @@ def test_open_backend_without_items_notes_link_command(monkeypatch, tmp_path):
         assert b.api is None and secrets.LINK_CMD in b.setup_notes[0]
     finally:
         b.close()
+
+
+def _csv_account(conn, name, type_, mask, symbol="ZZ", value="100", currency="CAD"):
+    acct = csvimport._hash("t", name, type_, mask)[:16]
+    conn.execute("INSERT INTO accounts VALUES (?,?,?,?, 'csv', 'now', NULL)", (acct, name, type_, mask))
+    conn.execute("INSERT INTO holdings VALUES (?, '2024-03-01', 0, ?, 'n', '1', '1', ?, ?, ?, 'csv', 'now', NULL)",
+                 (acct, symbol, value, value, currency))
+    conn.commit()
+
+
+class PlaidWith(FakePlaid):
+    def __init__(self, accounts, **kw):
+        super().__init__(**kw)
+        self.accounts = accounts
+
+    def accounts_get(self, token):
+        return {"accounts": self.accounts}
+
+    def investments_holdings_get(self, token):
+        return {"securities": [], "holdings": []}
+
+
+def test_different_type_strings_same_mask_merge_once(tmp_path):
+    conn = store.connect(tmp_path / "m.db")
+    _csv_account(conn, "Managed", "MANAGED_TFSA", "4444", value="700")
+    _csv_account(conn, "Brokerage", "NON_REGISTERED", "5555", value="300")
+    plaid = PlaidWith([_account("p1", "My TFSA", "tfsa", "4444", "CAD", 700),
+                       _account("p2", "Taxable", "brokerage", "5555", "CAD", 300)])
+    b = tools.Backend(conn, plaid, {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    out = tools.net_worth(b)
+    assert out["primary_total"] == "1000" and not [n for n in out["notes"] if "double" in n]
+    assert {a["source"] for a in tools.list_accounts(b)["accounts"]} == {"plaid"}
+    assert tools.allocation(b)["by_currency"]["CAD"]["by_account_type"][0]["value"] == "700"
+
+
+def test_ambiguous_mask_not_merged_with_note(tmp_path):
+    conn = store.connect(tmp_path / "m.db")
+    _csv_account(conn, "Managed", "TFSA", "4444", value="700")
+    plaid = PlaidWith([_account("p1", "TFSA one", "tfsa", "4444", "CAD", 700),
+                       _account("p2", "TFSA two", "tfsa", "4444", "CAD", 50)])
+    out = tools.net_worth(tools.Backend(conn, plaid, {ITEM_OK: TOKEN_OK}, today=lambda: TODAY))
+    assert out["primary_total"] == "1450"  # nothing merged, so the CSV account is counted and flagged
+    assert any("Managed" in n and "TFSA one" in n and "TFSA two" in n and "Possible double count" in n
+               for n in out["notes"])
+    assert not any("p1" in n or "p2" in n for n in out["notes"])
+
+
+def test_two_csv_accounts_to_one_plaid_account_not_merged(tmp_path):
+    conn = store.connect(tmp_path / "m.db")
+    _csv_account(conn, "Alpha", "TFSA", "4444", symbol="A", value="10")
+    _csv_account(conn, "Beta", "MANAGED_TFSA", "4444", symbol="B", value="20")
+    plaid = PlaidWith([_account("p1", "TFSA", "tfsa", "4444", "CAD", 30)])
+    out = tools.net_worth(tools.Backend(conn, plaid, {ITEM_OK: TOKEN_OK}, today=lambda: TODAY))
+    assert any("Alpha" in n and "Beta" in n and "all map to Plaid account TFSA" in n for n in out["notes"])
+    assert out["primary_total"] == "60"
+
+
+def test_csv_balance_has_as_of_and_cash_note(csv_only):
+    rows = tools.get_balances(csv_only)
+    crypto = next(r for r in rows["balances"] if r["name"] == "Fake Crypto")
+    assert crypto["as_of"] == "2024-03-31"
+    assert any("cash is not included" in n for n in rows["notes"])
+
+
+def test_invalid_currency_falls_back_to_cad(backend):
+    out = tools.net_worth(backend, "<script>")
+    assert out["primary_currency"] == "CAD" and any("Invalid currency" in n for n in out["notes"])
+
+
+class HostilePlaid(FakePlaid):
+    def accounts_get(self, token):
+        r = super().accounts_get(token)
+        r["accounts"][0]["name"] = f"TFSA {TOKEN_OK} {PID_USD} 987654321098"
+        return r
+
+    def item_get(self, token):
+        r = super().item_get(token)
+        r["item"]["error"] = {"error_code": f"E {TOKEN_OK}"}
+        r["item"]["institution_name"] = f"WS {PID_TFSA}"
+        return r
+
+    def investments_holdings_get(self, token):
+        raise PlaidError("BAD", f"failed for {TOKEN_OK} and {ITEM_OK} and {PID_TFSA} and access-sandbox-zzz-123")
+
+
+def test_markers_in_plaid_text_never_reach_output(csv_conn):
+    b = tools.Backend(csv_conn, HostilePlaid(), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    blob = json.dumps(all_outputs(b)) + json.dumps(tools.get_holdings(b, "tfsa"))
+    for marker in FORBIDDEN + ["987654321098", "access-sandbox-zzz-123"]:
+        assert marker not in blob
+    assert "BAD" in blob  # the code itself still surfaces
+
+
+def test_missing_token_note_hides_item_id(monkeypatch, tmp_path):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    secrets.set_plaid_keys(settings.plaid_env, "cid", "sec")
+    secrets._save_items(settings.plaid_env, [ITEM_OK])  # listed, but no token stored
+    out = server.list_accounts()
+    blob = json.dumps(out) + json.dumps(server.item_health()) + json.dumps(server.get_holdings("x"))
+    assert ITEM_OK not in blob and "access_token" not in blob
+    assert any("has no stored access token" in n and secrets.LINK_CMD in n for n in out["notes"])
+
+
+def test_corrupt_item_list_note_hides_key_names(monkeypatch, tmp_path, memory_keyring):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    secrets.set_plaid_keys(settings.plaid_env, "cid", "sec")
+    memory_keyring.set_password(secrets.SERVICE, f"linked_items_{settings.plaid_env}", "{not a list")
+    blob = json.dumps(server.list_accounts())
+    assert "linked_items" not in blob and "unreadable" in blob
+
+
+def test_run_error_path_returns_short_message(monkeypatch, tmp_path):
+    def boom(backend, *a):
+        raise RuntimeError(f"secret {TOKEN_OK}")
+
+    monkeypatch.setattr(server, "open_backend", lambda: tools.Backend(store.connect(tmp_path / "e.db"), None, {}))
+    assert server._run(boom) == {"error": "Tool failed (RuntimeError)."}
+
+    def fail():
+        raise OSError(TOKEN_OK)
+
+    monkeypatch.setattr(server, "open_backend", fail)
+    assert TOKEN_OK not in json.dumps(server._run(boom))

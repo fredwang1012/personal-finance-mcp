@@ -9,6 +9,7 @@ Amount sign convention for transactions: negative = cash out of the account, pos
 opposite for investment transactions, so its sign is flipped to match the CSV exports.
 """
 import hashlib
+import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -26,6 +27,15 @@ MAX_HOLDINGS = 500
 LIABILITY_TYPES = {"credit", "loan"}
 INVESTMENT_TYPES = {"buy", "sell", "dividend"}
 LINK_CMD = "python -m app.cli link"
+TOKEN_RE = re.compile(r"(?:access|link|public)-[a-z]+-[\w-]+")
+CURRENCY_RE = re.compile(r"[A-Z]{3}")
+TIMESTAMP_RE = re.compile(r"[0-9T:+.Z -]{1,40}")
+# normalised type keyword -> family; two account types are compatible when one contains the other or they share a family
+FAMILIES = {
+    "tfsa": "tfsa", "rrsp": "rrsp", "fhsa": "fhsa", "resp": "resp", "rrif": "rrif", "lira": "lira",
+    "nonregistered": "taxable", "brokerage": "taxable", "margin": "taxable", "individual": "taxable",
+    "cash": "cash", "chequing": "cash", "savings": "cash", "crypto": "crypto",
+}
 
 
 def _short(value: str) -> str:
@@ -54,9 +64,9 @@ def _public(row: dict) -> dict:
     return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
-def _error_note(short: str, exc: Exception) -> str:
+def _error_note(short: str, exc: Exception, clean: Callable[[str], str] = _text) -> str:
     if isinstance(exc, PlaidError):
-        note = f"Plaid item {short} failed: {_text(exc.code)}: {_text(exc.message)}"
+        note = f"Plaid item {short} failed: {clean(exc.code)}: {clean(exc.message)}"
         if exc.code == "ITEM_LOGIN_REQUIRED":
             note += f" Re-run `{LINK_CMD}` to reconnect it."
         return note
@@ -76,6 +86,15 @@ class Backend:
     tokens: dict[str, str] = field(default_factory=dict)  # item_id -> access token (never emitted)
     setup_notes: list[str] = field(default_factory=list)
     today: Callable[[], date] = date.today
+    _pids: set[str] = field(default_factory=set)  # Plaid account ids seen so far; scrubbed from free text
+
+    def clean(self, raw: Any) -> str:
+        """Sanitise free text from Plaid and remove anything that looks like a token or a known id."""
+        out = TOKEN_RE.sub("[redacted]", _text(str(raw or "")))
+        for secret in (*self.tokens.values(), *self.tokens, *self._pids):
+            if secret:
+                out = out.replace(secret, "[redacted]")
+        return out
 
     def close(self) -> None:
         self.conn.close()
@@ -91,16 +110,18 @@ class Backend:
         for item_id, token in self.tokens.items():
             short = _short(item_id)
             try:
-                item_accounts = [_plaid_account(a, short) for a in self.api.accounts_get(token).get("accounts", [])]
+                raw_accounts = self.api.accounts_get(token).get("accounts", [])
+                self._pids.update(a["account_id"] for a in raw_accounts)
+                item_accounts = [_plaid_account(a, short, self.clean) for a in raw_accounts]
                 by_pid = {a["_pid"]: a for a in item_accounts}
-                item_held = _plaid_holdings(self.api.investments_holdings_get(token), by_pid) if holdings else []
+                item_held = _plaid_holdings(self.api.investments_holdings_get(token), by_pid, self.clean) if holdings else []
                 item_txs = (
-                    _plaid_transactions(self.api.investments_transactions_get(token, *tx_range), by_pid)
+                    _plaid_transactions(self.api.investments_transactions_get(token, *tx_range), by_pid, self.clean)
                     if tx_range
                     else []
                 )
             except Exception as exc:  # one failing item must not hide the others; only code/message are surfaced
-                notes.append(_error_note(short, exc))
+                notes.append(_error_note(short, exc, self.clean))
                 continue
             accounts += item_accounts
             held += item_held
@@ -114,33 +135,53 @@ class Backend:
             for r in rows
         }
 
-    def _csv_values(self, csv_accounts: dict[str, dict]) -> dict[str, dict[str, Decimal]]:
-        """Latest holdings market value per CSV account and currency."""
+    def _csv_values(self, csv_accounts: dict[str, dict]):
+        """Latest holdings market value per CSV account and currency, plus the snapshot date per account."""
         totals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+        as_of: dict[str, str] = {}
         for h in store.latest_holdings(self.conn):
             value = _dec(h["market_value"])
             if h["account_id"] in csv_accounts and value is not None:
                 totals[h["account_id"]][h["currency"]] += value
-        return totals
+                as_of[h["account_id"]] = h["as_of"]
+        return totals, as_of
+
+    def _resolve(self, csv_accts: dict, plaid_accts: list[dict], notes: list[str]) -> dict[str, dict]:
+        """Map CSV account id -> Plaid account, only where the match is unique in both directions."""
+        match, conflicts, conflicted = _match_accounts(csv_accts, plaid_accts)
+        notes.extend(conflicts)
+        if plaid_accts:
+            for cid, c in csv_accts.items():
+                if cid not in match and cid not in conflicted:
+                    notes.append(
+                        f"Possible double count: CSV account {c['name']} \u2022\u2022{c['mask']} "
+                        "wasn't matched to a Plaid account."
+                    )
+        return match
 
     def _merged_accounts(self, notes: list[str], holdings: bool = False):
         """Plaid accounts plus CSV accounts that no Plaid account covers. Returns (rows, plaid_accts, csv_accts, match, held)."""
         plaid_accts, plaid_held, _ = self._load_plaid(notes, holdings=holdings)
         csv_accts = self._csv_accounts()
-        match = {cid: p for cid, c in csv_accts.items() if (p := _match(c, plaid_accts))}
-        values = self._csv_values(csv_accts)
+        match = self._resolve(csv_accts, plaid_accts, notes)
+        values, as_of = self._csv_values(csv_accts)
         rows = list(plaid_accts)
+        derived = False
         for cid, c in csv_accts.items():
             if cid in match:
                 continue
             if values.get(cid):
+                derived = True
                 rows += [
                     {**c, "currency": cur, "current": _str(v), "available": None, "limit": None,
-                     "basis": "holdings_market_value"}
+                     "basis": "holdings_market_value", "as_of": as_of[cid]}
                     for cur, v in sorted(values[cid].items())
                 ]
             else:
-                rows.append({**c, "currency": None, "current": None, "available": None, "limit": None, "basis": None})
+                rows.append({**c, "currency": None, "current": None, "available": None, "limit": None, "basis": None,
+                             "as_of": None})
+        if derived:
+            notes.append("CSV account balances are the market value of the latest holdings snapshot (see as_of); cash is not included.")
         return rows, plaid_accts, csv_accts, match, plaid_held
 
     def _merged_holdings(self, notes: list[str]) -> list[dict]:
@@ -172,7 +213,7 @@ class Backend:
         start = end - timedelta(days=days)
         plaid_accts, _, plaid_txs = self._load_plaid(notes, tx_range=(start, end))
         csv_accts = self._csv_accounts()
-        match = {cid: p for cid, c in csv_accts.items() if (p := _match(c, plaid_accts))}
+        match = self._resolve(csv_accts, plaid_accts, notes)
         covered = {(t["account_id"], t["date"]) for t in plaid_txs}
         rows = list(plaid_txs)
         cur = self.conn.execute(
@@ -198,19 +239,19 @@ class Backend:
         return rows
 
 
-def _plaid_account(a: dict, item_short: str) -> dict:
+def _plaid_account(a: dict, item_short: str, clean: Callable[[str], str]) -> dict:
     b = a.get("balances") or {}
     return {
-        "id": _short(a["account_id"]), "_pid": a["account_id"], "name": _text(a.get("name") or a.get("official_name") or ""),
-        "_official": _text(a.get("official_name") or ""), "type": _enum(a.get("type")).lower(),
+        "id": _short(a["account_id"]), "_pid": a["account_id"], "name": clean(a.get("name") or a.get("official_name") or ""),
+        "_official": clean(a.get("official_name") or ""), "type": _enum(a.get("type")).lower(),
         "subtype": _enum(a.get("subtype")).lower() or None, "mask": (a.get("mask") or "")[-4:],
         "currency": b.get("iso_currency_code") or b.get("unofficial_currency_code") or None,
         "current": _str(_dec(b.get("current"))), "available": _str(_dec(b.get("available"))),
-        "limit": _str(_dec(b.get("limit"))), "basis": "reported_balance", "source": "plaid", "item": item_short,
+        "limit": _str(_dec(b.get("limit"))), "basis": "reported_balance", "as_of": None, "source": "plaid", "item": item_short,
     }
 
 
-def _plaid_holdings(resp: dict, by_pid: dict[str, dict]) -> list[dict]:
+def _plaid_holdings(resp: dict, by_pid: dict[str, dict], clean: Callable[[str], str]) -> list[dict]:
     securities = {s["security_id"]: s for s in resp.get("securities", [])}
     rows = []
     for h in resp.get("holdings", []):
@@ -220,7 +261,7 @@ def _plaid_holdings(resp: dict, by_pid: dict[str, dict]) -> list[dict]:
         sec = securities.get(h.get("security_id")) or {}
         rows.append({
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "account_type": acct["type"],
-            "symbol": _text(sec.get("ticker_symbol") or "").upper(), "name": _text(sec.get("name") or ""),
+            "symbol": clean(sec.get("ticker_symbol") or "").upper(), "name": clean(sec.get("name") or ""),
             "quantity": _str(_dec(h.get("quantity"))), "price": _str(_dec(h.get("institution_price"))),
             "market_value": _str(_dec(h.get("institution_value"))), "cost_basis": _str(_dec(h.get("cost_basis"))),
             "currency": h.get("iso_currency_code") or sec.get("iso_currency_code") or acct["currency"],
@@ -231,7 +272,7 @@ def _plaid_holdings(resp: dict, by_pid: dict[str, dict]) -> list[dict]:
     return rows
 
 
-def _plaid_transactions(resp: dict, by_pid: dict[str, dict]) -> list[dict]:
+def _plaid_transactions(resp: dict, by_pid: dict[str, dict], clean: Callable[[str], str]) -> list[dict]:
     securities = {s["security_id"]: s for s in resp.get("securities", [])}
     rows = []
     for t in resp.get("investment_transactions", []):
@@ -243,28 +284,68 @@ def _plaid_transactions(resp: dict, by_pid: dict[str, dict]) -> list[dict]:
         kind = _activity_type(f"{subtype} {plaid_type}")
         amount = _dec(t.get("amount"))
         rows.append({
-            "date": str(t["date"])[:10], "description": _text(t.get("name") or ""),
+            "date": str(t["date"])[:10], "description": clean(t.get("name") or ""),
             "amount": _str(-amount if amount is not None else None),
             "currency": t.get("iso_currency_code") or acct["currency"],
             "type": plaid_type if kind == "other" else kind,
-            "symbol": _text(sec.get("ticker_symbol") or "").upper() or None,
+            "symbol": clean(sec.get("ticker_symbol") or "").upper() or None,
             "account_id": acct["id"], "account": acct["name"], "account_mask": acct["mask"], "source": "plaid",
         })
     return rows
 
 
-def _match(csv_acct: dict, plaid_accts: list[dict]) -> dict | None:
-    """(type, mask) first; the name is the fallback when the mask or type does not line up."""
-    kind = _norm(csv_acct["type"])
-    for p in plaid_accts:
-        if csv_acct["mask"] and csv_acct["mask"] == p["mask"] and (not kind or kind in (_norm(p["type"]), _norm(p["subtype"] or ""))):
-            return p
-    name = csv_acct["name"].casefold()
-    if name:
-        for p in plaid_accts:
-            if name in (p["name"].casefold(), p["_official"].casefold()):
-                return p
-    return None
+def _family(norm: str) -> str | None:
+    return next((fam for key, fam in FAMILIES.items() if key in norm), None)
+
+
+def _types_compatible(csv_type: str, p: dict) -> bool:
+    c = _norm(csv_type)
+    if not c:
+        return True
+    for t in (_norm(p["type"]), _norm(p["subtype"] or "")):
+        if t and (c in t or t in c or (_family(c) and _family(c) == _family(t))):
+            return True
+    return False
+
+
+def _label(a: dict) -> str:
+    return f"{a['name']} \u2022\u2022{a['mask']}"
+
+
+def _match_accounts(csv_accts: dict, plaid_accts: list[dict]) -> tuple[dict[str, dict], list[str], set[str]]:
+    """Unique CSV -> Plaid matches (mask + compatible type, then name). Also returns notes and the unmerged CSV ids."""
+    proposals: dict[str, dict] = {}
+    conflicts: list[str] = []
+    conflicted: set[str] = set()
+    for cid, c in csv_accts.items():
+        cands = [p for p in plaid_accts if c["mask"] and c["mask"] == p["mask"] and _types_compatible(c["type"], p)]
+        if not cands and c["name"]:
+            name = c["name"].casefold()
+            cands = [p for p in plaid_accts if name in (p["name"].casefold(), p["_official"].casefold())]
+        if len(cands) > 1:
+            conflicted.add(cid)
+            conflicts.append(
+                f"CSV account {_label(c)} not merged: it could match several Plaid accounts ("
+                + ", ".join(_label(p) for p in cands) + "). Possible double count."
+            )
+        elif cands:
+            proposals[cid] = cands[0]
+    by_plaid: dict[str, list[str]] = defaultdict(list)
+    for cid, p in proposals.items():
+        by_plaid[p["id"]].append(cid)
+    match: dict[str, dict] = {}
+    for cid, p in proposals.items():
+        group = by_plaid[p["id"]]
+        if len(group) == 1:
+            match[cid] = p
+            continue
+        conflicted.add(cid)
+        if cid == group[0]:
+            conflicts.append(
+                "CSV accounts " + ", ".join(_label(csv_accts[g]) for g in group)
+                + f" all map to Plaid account {_label(p)}; not merged. Possible double count."
+            )
+    return match, conflicts, conflicted
 
 
 def _bucket(account_type: str) -> str:
@@ -288,7 +369,7 @@ def list_accounts(backend: Backend) -> dict:
     accounts = [
         {
             **{k: r[k] for k in ("id", "name", "type", "subtype", "mask", "currency", "source")},
-            "balances": {k: r[k] for k in ("current", "available", "limit", "basis")},
+            "balances": {k: r[k] for k in ("current", "available", "limit", "basis", "as_of")},
         }
         for r in rows
     ]
@@ -299,7 +380,7 @@ def get_balances(backend: Backend) -> dict:
     notes = _start(backend)
     rows, *_ = backend._merged_accounts(notes)
     balances = [
-        {k: r[k] for k in ("id", "name", "type", "subtype", "mask", "currency", "current", "available", "basis", "source")}
+        {k: r[k] for k in ("id", "name", "type", "subtype", "mask", "currency", "current", "available", "basis", "as_of", "source")}
         for r in rows
     ]
     return _result(notes, balances=balances)
@@ -368,7 +449,10 @@ def net_worth(backend: Backend, currency: str = "CAD") -> dict:
         cur: {"total": _str(sum(types.values(), Decimal())), "by_account_type": {t: _str(v) for t, v in sorted(types.items())}}
         for cur, types in sorted(by_cur.items())
     }
-    primary = currency.upper()
+    primary = currency.strip().upper()
+    if not CURRENCY_RE.fullmatch(primary):
+        notes.append("Invalid currency code; using CAD.")
+        primary = "CAD"
     mixed = len(currencies) > 1
     if mixed:
         notes.append("Several currencies are present. They are reported separately and not converted.")
@@ -416,23 +500,23 @@ def item_health(backend: Backend) -> dict:
         try:
             item = backend.api.item_get(token).get("item") or {}
         except Exception as exc:
-            notes.append(_error_note(short, exc))
+            notes.append(_error_note(short, exc, backend.clean))
             items.append({"id": short, "institution": None, "products": [], "last_successful_update": None,
-                          "error_code": exc.code if isinstance(exc, PlaidError) else type(exc).__name__})
+                          "error_code": backend.clean(exc.code) if isinstance(exc, PlaidError) else type(exc).__name__})
             continue
         status = item.get("status") or {}
         updates = [
             str((status.get(k) or {}).get("last_successful_update"))
             for k in ("investments", "transactions")
-            if (status.get(k) or {}).get("last_successful_update")
+            if TIMESTAMP_RE.fullmatch(str((status.get(k) or {}).get("last_successful_update") or ""))
         ]
         error = item.get("error") or {}
-        code = _text(_enum(error.get("error_code"))) or None
+        code = backend.clean(_enum(error.get("error_code"))) or None
         if code == "ITEM_LOGIN_REQUIRED":
             notes.append(f"Plaid item {short} needs re-authentication. Re-run `{LINK_CMD}` to reconnect it.")
         items.append({
-            "id": short, "institution": _text(item.get("institution_name") or "") or None,
-            "products": sorted(_enum(p) for p in item.get("products") or []),
+            "id": short, "institution": backend.clean(item.get("institution_name") or "") or None,
+            "products": sorted(backend.clean(_enum(p)) for p in item.get("products") or []),
             "last_successful_update": max(updates) if updates else None, "error_code": code,
         })
     return _result(notes, items=items)

@@ -15,7 +15,8 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotent
 CONVENTIONS = (
     "Money values are decimal strings in the row's own currency (e.g. CAD, USD); different currencies are never "
     "converted. Each row has source 'plaid' or 'csv' (Wealthsimple CSV import); Plaid wins when both cover an account. "
-    "Account ids are short local ids and masks are the last 4 characters only. Check 'notes' for problems."
+    "Account ids are short local ids and masks are the last 4 characters only. CSV holdings usually have "
+    "security_type null (unclassified). Bank (non-investment) transactions are not covered. Check 'notes' for problems."
 )
 TX_CONVENTIONS = (
     " Transaction amounts: negative = cash out of the account, positive = cash in. 'days' is capped at "
@@ -36,20 +37,25 @@ def open_backend() -> tools.Backend:
         if not secrets.has_plaid_keys(env):
             notes.append(f"No Plaid keys stored; showing CSV data only. Run: {secrets.SET_KEYS_CMD}")
         else:
-            item_ids = secrets.list_item_ids(env)
+            try:
+                item_ids = secrets.list_item_ids(env)
+            except secrets.MissingSecret:
+                item_ids = []
+                notes.append(f"The stored list of linked items is unreadable. Run: {secrets.LINK_CMD}")
             if not item_ids:
                 notes.append(f"No linked Plaid items; showing CSV data only. Run: {secrets.LINK_CMD}")
             for item_id in item_ids:
                 try:
                     tokens[item_id] = secrets.get_access_token(env, item_id)
-                except secrets.MissingSecret as exc:
-                    notes.append(str(exc))
+                except secrets.MissingSecret:
+                    # the exception text names the keychain entry, which contains the raw item id
+                    notes.append(f"Plaid item {tools._short(item_id)} has no stored access token. Run: {secrets.LINK_CMD}")
             if tokens:
                 from app.plaid_client import RealPlaid
 
                 api = RealPlaid.from_settings(settings)
-    except secrets.MissingSecret as exc:
-        notes.append(str(exc))
+    except secrets.MissingSecret:
+        notes.append(f"Plaid keys are missing. Run: {secrets.SET_KEYS_CMD}")
     except Exception as exc:
         notes.append(f"Keychain or Plaid setup failed ({type(exc).__name__}); showing CSV data only.")
         tokens, api = {}, None

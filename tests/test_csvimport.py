@@ -295,3 +295,29 @@ def test_plain_uppercase_account_name_stays_a_name(conn, tmp_path):
     path = _mk(tmp_path, "Account,Symbol,Quantity,Market Price Currency\nNON-REGISTERED,ZZTEST,1,CAD\n")
     csvimport.import_file(path, conn)
     assert conn.execute("SELECT name, mask FROM accounts").fetchone() == ("NON-REGISTERED", "")
+
+
+def test_unchanged_split_lot_reimport_reports_duplicates_only(conn, tmp_path):
+    path = _mk(tmp_path, HOLD_HEAD + "Fake TFSA,TEST-1111,ZZTEST,Fund,6,10,CAD,60,50,2024-03-31\n"
+               "Fake TFSA,TEST-1111,ZZTEST,Fund,4,10,CAD,40,30,2024-03-31\n")
+    csvimport.import_file(path, conn)
+    res = csvimport.import_file(path, conn)
+    assert (res.added, res.updated, res.duplicates) == (0, 0, 1)
+    assert conn.execute("SELECT quantity FROM holdings").fetchall() == [("10",)]
+
+
+def test_lot_with_missing_market_value_rejects_merge(conn, tmp_path):
+    path = _mk(tmp_path, HOLD_HEAD + "Fake TFSA,TEST-1111,ZZTEST,Fund,6,10,CAD,60,50,2024-03-31\n"
+               "Fake TFSA,TEST-1111,ZZTEST,Fund,4,10,CAD,,30,2024-03-31\n")
+    res = csvimport.import_file(path, conn)
+    assert res.rejected == [(3, "cannot combine lots: market value missing in one of them")]
+    assert conn.execute("SELECT quantity, market_value FROM holdings").fetchall() == [("6", "60")]
+
+
+def test_identifier_heuristic_case_insensitive_but_keeps_labels(conn, tmp_path):
+    path = _mk(tmp_path, "Account,Symbol,Quantity,Market Price Currency\nab-77-xyz12,ZZ,1,CAD\nRRSP-2024-01,ZZ,1,CAD\n")
+    csvimport.import_file(path, conn)
+    rows = dict(conn.execute("SELECT name, mask FROM accounts").fetchall())
+    label = next(n for n in rows if n.startswith("RRSP"))
+    assert rows[label] == ""  # a label, not a number: nothing taken as the mask
+    assert "ab-77-xyz12" not in rows and "yz12" in rows.values()
