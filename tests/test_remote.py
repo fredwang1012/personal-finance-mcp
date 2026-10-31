@@ -2,6 +2,7 @@
 
 Everything runs in process through Starlette's TestClient: no network, no real GitHub, Plaid or keychain.
 """
+import asyncio
 import json
 import re
 import secrets as pysecrets
@@ -15,7 +16,7 @@ from app import secrets, server
 from app.auth import CLAUDE_CALLBACKS, CONSENT_COOKIE, GITHUB_CALLBACK_PATH, ClientAdmin, fingerprint, s256
 from app.config import ROOT, settings
 from app.remote import Guard, Limits, RateLimiter, RemoteConfig, build_app
-from tests.test_tools import FORBIDDEN, ITEM_OK, TOKEN_OK, FakePlaid, HostilePlaid
+from tests.test_tools import FORBIDDEN, ITEM_OK, TOKEN_OK, FakePlaid, HostileData, HostilePlaid
 
 PUBLIC = "https://vm.example-tailnet.ts.net"
 RESOURCE = PUBLIC + "/mcp"
@@ -395,9 +396,10 @@ def test_no_route_or_code_path_can_write(remote):
         assert not [w for w in writes if w in source], module
 
 
-def test_markers_never_reach_http_output(remote, monkeypatch):
+@pytest.mark.parametrize("hostile", [HostilePlaid, HostileData])
+def test_markers_never_reach_http_output(remote, monkeypatch, hostile):
     client, provider, _ = remote
-    monkeypatch.setattr(server, "plaid_factory", lambda s: HostilePlaid())
+    monkeypatch.setattr(server, "plaid_factory", lambda s: hostile())
     _, tokens = full_login(client, provider)
     blob = ""
     for i, name in enumerate(sorted(TOOLS)):
@@ -409,8 +411,11 @@ def test_markers_never_reach_http_output(remote, monkeypatch):
         r = rpc(client, tokens["access_token"], "tools/call", {"name": name, "arguments": args}, rid=50 + i)
         assert r.status_code == 200 and "error" not in tool_payload(r), name
         blob += r.text
-    assert "BAD" in blob  # the Plaid error code still surfaces, so the hostile fake really ran
-    for marker in FORBIDDEN + ["987654321098", "access-sandbox-zzz-123"]:
+    if hostile is HostilePlaid:
+        assert "BAD" in blob  # the Plaid error code still surfaces, so the hostile fake really ran
+    else:
+        assert '\\"security_type\\":\\"other\\"' in blob  # hostile holdings were processed, not refused
+    for marker in FORBIDDEN + ["987654321098", "access-sandbox-zzz-123", "evil.example"]:
         assert marker not in blob, marker
 
 
@@ -889,13 +894,138 @@ def test_ip_buckets_aggregate_networks():
     assert ip_bucket("testclient") == "testclient"
 
 
-def test_missing_forwarded_address_is_warned_once(tmp_path, plaid, caplog):
+def test_missing_forwarded_address_refuses_anonymous_requests(tmp_path, plaid, caplog):
     app, provider, _ = make(tmp_path)
     with TestClient(app, base_url=PUBLIC, client=("127.0.0.1", 5000)) as c, caplog.at_level("WARNING"):
-        c.get("/.well-known/oauth-authorization-server")
-        c.get("/.well-known/oauth-authorization-server")
-    assert sum("X-Forwarded-For" in r.message for r in caplog.records) == 1
+        for _ in range(2):
+            r = c.get("/.well-known/oauth-authorization-server")
+            assert r.status_code == 503 and r.json()["error"] == "misconfigured_proxy"
+        assert c.post("/register", json={"redirect_uris": [CB]}).status_code == 503
+        assert c.post("/token", data={"grant_type": "refresh_token"}).status_code == 503
+        assert c.get("/authorize").status_code == 503
+        assert rpc(c, None, "tools/list").status_code == 503
+    errors = [r for r in caplog.records if "X-Forwarded-For" in r.message]
+    assert len(errors) == 1 and errors[0].levelname == "ERROR" and "127.0.0.1" in errors[0].message
     provider.close()
+
+
+def test_missing_forwarded_address_check_can_be_turned_off(tmp_path, plaid, caplog):
+    cfg = RemoteConfig(PUBLIC, 8765, OWNER, KEY, tmp_path / "remote")
+    app, provider = build_app(cfg, FakeGitHub(OWNER), clock=Clock(), limiter=RateLimiter(),
+                              require_forwarded_for=False)
+    with TestClient(app, base_url=PUBLIC, client=("127.0.0.1", 5000)) as c, caplog.at_level("WARNING"):
+        assert c.get("/.well-known/oauth-authorization-server").status_code == 200
+        c.get("/.well-known/oauth-authorization-server")
+    warnings = [r for r in caplog.records if "X-Forwarded-For" in r.message]
+    assert len(warnings) == 1 and warnings[0].levelname == "WARNING"
+    provider.close()
+
+
+def test_unforwarded_owner_with_valid_token_is_not_throttled_by_anonymous_floods(tmp_path, plaid):
+    limiter, limits = RateLimiter(), Limits()
+    cfg = RemoteConfig(PUBLIC, 8765, OWNER, KEY, tmp_path / "remote")
+    app, provider = build_app(cfg, FakeGitHub(OWNER), limits=limits, clock=Clock(), limiter=limiter)
+    provider.approval_refresh = 0
+    local_peer = {"on": False}
+
+    async def peer(scope, receive, send):  # lets one client switch to arriving without X-Forwarded-For
+        if scope["type"] == "http" and local_peer["on"]:
+            scope = {**scope, "client": ("127.0.0.1", 5000)}
+        await app(scope, receive, send)
+
+    with TestClient(peer, base_url=PUBLIC) as c:
+        _, tokens = full_login(c, provider)  # signed in through a normal, forwarded address
+        # whatever floods 127.0.0.1 could at most exhaust the loopback address and network buckets; do that outright
+        for key, rule in (("a:127.0.0.1", limits.per_addr), ("n:127.0.0.0/24", limits.per_net)):
+            table = limiter.addr if key.startswith("a:") else limiter.net
+            while limiter.take([(table, key, rule)]) is None:
+                pass
+        local_peer["on"] = True
+        for i in range(10):  # anonymous and bad-token floods arriving without X-Forwarded-For
+            assert rpc(c, None, "tools/list").status_code == 503
+            assert rpc(c, "not-a-token", "tools/list").status_code == 503
+            assert c.post("/register", json={"redirect_uris": [CB]}).status_code == 503
+        # the loopback address and network buckets are exhausted: only the per-client limit applies
+        codes = [rpc(c, tokens["access_token"], "tools/list", rid=i).status_code for i in range(8)]
+        assert codes == [200] * 8
+    provider.close()
+
+
+def _guard_call(guard, path="/register", method="POST", client=("203.0.113.5", 1000), headers=(), receive=None):
+    async def default_receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "path": path, "method": method, "client": client, "headers": list(headers),
+             "query_string": b"", "server": ("127.0.0.1", 8765)}
+    return guard(scope, receive or default_receive, send), sent
+
+
+def test_slow_request_body_times_out_with_408():
+    async def reader(scope, receive, send):
+        while (await receive()).get("more_body"):
+            pass
+        await _send_json(send, 200, {})
+
+    from app.remote import _send_json
+
+    guard = Guard(reader, RateLimiter(), Limits(), RESOURCE, body_timeout=0.05)
+    chunks = iter([{"type": "http.request", "body": b"{", "more_body": True}])
+
+    async def slow_receive():
+        try:
+            return next(chunks)
+        except StopIteration:
+            await asyncio.sleep(5)  # the rest of the body never arrives
+
+    async def run():
+        call, sent = _guard_call(guard, receive=slow_receive)
+        await asyncio.wait_for(call, 2)
+        return sent
+
+    sent = asyncio.run(run())
+    assert sent[0]["status"] == 408 and json.loads(sent[1]["body"]) == {"error": "request_timeout"}
+    call, sent = _guard_call(guard)  # a complete body is unaffected
+    asyncio.run(call)
+    assert sent[0]["status"] == 200
+
+
+def test_anonymous_requests_capped_per_address_in_flight():
+    release = None
+
+    async def blocking(scope, receive, send):
+        await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        guard = Guard(blocking, RateLimiter(), Limits(), RESOURCE, anon_concurrency=4)
+        calls = [_guard_call(guard) for _ in range(4)]
+        tasks = [asyncio.create_task(c) for c, _ in calls]
+        await asyncio.sleep(0.01)
+        over, over_sent = _guard_call(guard)
+        await over
+        other, other_sent = _guard_call(guard, client=("198.51.100.8", 1000))  # another address is not affected
+        other_task = asyncio.create_task(other)
+        bearer, bearer_sent = _guard_call(guard, path="/mcp", headers=[(b"authorization", b"Bearer x")])
+        bearer_task = asyncio.create_task(bearer)  # requests with a token are not counted here
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(*tasks, other_task, bearer_task)
+        after, after_sent = _guard_call(guard)
+        await after
+        return [s for _, s in calls], over_sent, other_sent, bearer_sent, after_sent, guard
+
+    firsts, over, other, bearer, after, guard = asyncio.run(run())
+    assert [s[0]["status"] for s in firsts] == [200] * 4
+    assert over[0]["status"] == 429 and other[0]["status"] == 200 and bearer[0]["status"] == 200
+    assert after[0]["status"] == 200 and guard._in_flight == {}
 
 
 def test_revoke_all_clients(remote, monkeypatch, capsys):

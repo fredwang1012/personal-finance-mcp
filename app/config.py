@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     http_port: int = 8765
     github_client_id: str = ""
     github_allowed_user_id: int = 0  # numeric GitHub user id, not the login name
+    # refuse anonymous requests that arrive without X-Forwarded-For (a misconfigured Funnel target); set false only to
+    # test the server directly on the VM
+    require_forwarded_for: bool = True
 
     @field_validator("data_dir")
     @classmethod

@@ -5,6 +5,7 @@ app.auth for this exact resource URL. Around the SDK's app sit a body-size cap, 
 RateLimiter), an audit log of tool names (never arguments or results) and an error guard that never returns a
 traceback.
 """
+import asyncio
 import base64
 import ipaddress
 import json
@@ -40,6 +41,10 @@ from app.auth import (
 log = logging.getLogger("personal-finance-mcp.remote")
 
 MAX_BODY = 64 * 1024  # MCP requests here are tiny tool calls; DCR and token forms are smaller still
+BODY_TIMEOUT = 10.0  # seconds to wait for each chunk of a request body before answering 408
+ANON_CONCURRENCY = 4  # requests in flight at once per address without a bearer token
+LOOPBACK = ("127.0.0.1", "::1")
+MISCONFIGURED = {"error": "misconfigured_proxy", "error_description": "The proxy did not forward the client address."}
 TOOL_NAMES = frozenset(fn.__name__ for fn, _ in server.TOOLS)
 
 
@@ -197,14 +202,32 @@ class _TooLarge(Exception):
     pass
 
 
+class _BodyTimeout(Exception):
+    pass
+
+
+def _has_bearer(scope: dict, headers: dict) -> bool:
+    return scope.get("path") == "/mcp" and headers.get(b"authorization", b"")[:7].lower() == b"bearer "
+
+
+def _unforwarded(scope: dict) -> bool:
+    """The peer is loopback: uvicorn found no X-Forwarded-For to replace it with, so the real client is unknown."""
+    return (scope.get("client") or ("unknown",))[0] in LOOPBACK
+
+
 SECURITY_HEADERS = [(b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"no-referrer")]
 
 
 class Guard:
     """Outermost layer: error guard, body cap, per-IP and per-endpoint rate limits, /token resource check."""
 
-    def __init__(self, app, limiter: RateLimiter, limits: Limits, resource: str, provider=None):
+    def __init__(self, app, limiter: RateLimiter, limits: Limits, resource: str, provider=None,
+                 require_forwarded_for: bool = True, body_timeout: float = BODY_TIMEOUT,
+                 anon_concurrency: int = ANON_CONCURRENCY):
         self.app, self.limiter, self.limits, self.resource, self.provider = app, limiter, limits, resource, provider
+        self.require_forwarded_for, self.body_timeout = require_forwarded_for, body_timeout
+        self.anon_concurrency = anon_concurrency
+        self._in_flight: dict[str, int] = {}  # anonymous requests per address; an entry is removed at zero
         self._warned_no_forwarded_ip = False
 
     async def __call__(self, scope, receive, send):
@@ -229,6 +252,9 @@ class Guard:
         except _TooLarge:
             if not started:
                 await _send_json(guarded_send, 413, {"error": "too_large"})
+        except _BodyTimeout:
+            if not started:
+                await _send_json(guarded_send, 408, {"error": "request_timeout"})
         except Exception as exc:  # never a traceback or exception text to the client
             log.error("request failed: %s", type(exc).__name__)
             if not started:
@@ -238,12 +264,33 @@ class Guard:
         path, method = scope.get("path", ""), scope.get("method", "")
         # uvicorn's proxy_headers puts the Funnel client address here (only 127.0.0.1 is trusted to set it)
         ip = (scope.get("client") or ("unknown",))[0]
-        if ip in ("127.0.0.1", "::1") and not self._warned_no_forwarded_ip:
-            self._warned_no_forwarded_ip = True
-            log.warning("request without a forwarded client address (no X-Forwarded-For from the proxy); "
-                        "per-address limits then apply to all clients together")
-        request_ip.set(ip)
         headers = dict(scope.get("headers") or [])
+        bearer, unforwarded = _has_bearer(scope, headers), _unforwarded(scope)
+        if unforwarded and not self._warned_no_forwarded_ip:
+            self._warned_no_forwarded_ip = True
+            if self.require_forwarded_for:
+                log.error("misconfigured proxy: request without a forwarded client address (no X-Forwarded-For). "
+                          "Anonymous requests get 503 until Funnel targets http://127.0.0.1:<HTTP_PORT>.")
+            else:
+                log.warning("request without a forwarded client address (no X-Forwarded-For from the proxy); "
+                            "per-address limits then apply to all clients together")
+        if unforwarded and self.require_forwarded_for and not bearer:
+            # every caller would share 127.0.0.1, so a stranger could rate limit the owner; refuse instead
+            return await _send_json(send, 503, MISCONFIGURED)
+        request_ip.set(ip)
+        if bearer:  # limited per OAuth client in layer 2 once the token is checked
+            return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
+        if self._in_flight.get(ip, 0) >= self.anon_concurrency:
+            return await _too_many(send, 1)
+        self._in_flight[ip] = self._in_flight.get(ip, 0) + 1
+        try:
+            return await self._admitted(scope, receive, send, path, method, ip, headers, bearer, unforwarded)
+        finally:
+            self._in_flight[ip] -= 1
+            if not self._in_flight[ip]:
+                del self._in_flight[ip]
+
+    async def _admitted(self, scope, receive, send, path, method, ip, headers, bearer, unforwarded):
         try:
             length = int(headers.get(b"content-length", b"0") or 0)
         except ValueError:
@@ -257,7 +304,12 @@ class Guard:
         endpoint = (("register", rules.register_addr) if is_register
                     else ("login", rules.login_addr) if path == "/authorize" or path.startswith("/oauth/")
                     else ("token", rules.token_addr) if is_token else None)
-        retry, skipped_overflow = lim.layer1(ip, endpoint, rules, may_skip_overflow=is_token or path == "/mcp")
+        if bearer and unforwarded:
+            # all such callers share 127.0.0.1, so an address bucket would let anyone throttle the owner; a valid
+            # token is limited per OAuth client in layer 2, and an invalid one is refused there
+            retry, skipped_overflow = None, False
+        else:
+            retry, skipped_overflow = lim.layer1(ip, endpoint, rules, may_skip_overflow=is_token or path == "/mcp")
         if retry:
             return await _too_many(send, retry)
         scope.setdefault("state", {})["pfm_overflow"] = skipped_overflow
@@ -266,15 +318,23 @@ class Guard:
             if retry:
                 return await _too_many(send, retry)
 
-        received = 0
+        received, body_done = 0, False
 
         async def counted_receive():
-            nonlocal received
-            message = await receive()
+            nonlocal received, body_done
+            if body_done:  # after the body, receive() only waits for a disconnect: no timeout there
+                return await receive()
+            try:
+                message = await asyncio.wait_for(receive(), self.body_timeout)
+            except asyncio.TimeoutError:
+                raise _BodyTimeout() from None
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > MAX_BODY:
                     raise _TooLarge()
+                body_done = not message.get("more_body")
+            else:
+                body_done = True
             return message
 
         if not is_token:
@@ -334,14 +394,20 @@ def _basic_client_id(header: bytes) -> str:
 class ClientRateLimit:
     """Layer 2 for /mcp, inside the SDK's auth middleware so the authenticated OAuth client is known."""
 
-    def __init__(self, app, limiter: RateLimiter, rule: tuple[int, int], anonymous_rule: tuple[int, int]):
+    def __init__(self, app, limiter: RateLimiter, rule: tuple[int, int], anonymous_rule: tuple[int, int],
+                 require_forwarded_for: bool = True):
         self.app, self.limiter, self.rule, self.anonymous_rule = app, limiter, rule, anonymous_rule
+        self.require_forwarded_for = require_forwarded_for
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path") == "/mcp":
             user = scope.get("user")
             if isinstance(user, AuthenticatedUser):
                 retry = self.limiter.take_client(f"mcp:{user.access_token.client_id}", self.rule)
+            elif self.require_forwarded_for and _unforwarded(scope):
+                # a bearer token that did not authenticate skipped layer 1 (see Guard): refuse it like any other
+                # request without a forwarded address
+                return await _send_json(send, 503, MISCONFIGURED)
             elif (scope.get("state") or {}).get("pfm_overflow"):
                 retry = self.limiter.take([(None, "overflow", self.limiter.OVERFLOW_RULE)])
             else:
@@ -387,7 +453,7 @@ def check_public_url(url: str) -> str | None:
 
 
 def build_app(cfg: RemoteConfig, github, limits: Limits = Limits(), clock: Callable[[], float] = time.time,
-              limiter: RateLimiter | None = None):
+              limiter: RateLimiter | None = None, require_forwarded_for: bool = True):
     """The ASGI app; returns (app, provider). `github` is app.auth.GitHub or a test fake."""
     public = cfg.public_url.rstrip("/")
     audit = Audit(cfg.data_dir / "audit.log")
@@ -420,10 +486,11 @@ def build_app(cfg: RemoteConfig, github, limits: Limits = Limits(), clock: Calla
     limiter = limiter or RateLimiter()
     # layer 2: appended after the SDK's auth middleware, so it runs with the authenticated user known
     app.user_middleware.append(Middleware(ClientRateLimit, limiter=limiter, rule=limits.mcp_client,
-                                          anonymous_rule=limits.mcp_anonymous_addr))
+                                          anonymous_rule=limits.mcp_anonymous_addr,
+                                          require_forwarded_for=require_forwarded_for))
     # layer 2 for /token: the provider calls this once the SDK has authenticated the client and validated the grant
     provider.client_rate_limit = lambda client_id: limiter.take_client(f"token:{client_id}", limits.token_client)
-    return Guard(app, limiter, limits, auth_cfg.resource, provider), provider
+    return Guard(app, limiter, limits, auth_cfg.resource, provider, require_forwarded_for), provider
 
 
 def _advertise_public_clients(app, settings: AuthSettings) -> None:
@@ -469,7 +536,8 @@ def serve() -> int:
     server.install_test_mode()
     cfg = RemoteConfig(settings.public_url, settings.http_port, settings.github_allowed_user_id, key,
                        settings.data_dir)
-    app, _ = build_app(cfg, GitHub(settings.github_client_id, gh_secret))
+    app, _ = build_app(cfg, GitHub(settings.github_client_id, gh_secret),
+                       require_forwarded_for=settings.require_forwarded_for)
     print(f"Serving {cfg.public_url.rstrip('/')}/mcp from http://127.0.0.1:{cfg.port}", file=sys.stderr)
     # access_log off: query strings carry OAuth state and GitHub codes. proxy_headers trusts only 127.0.0.1.
     uvicorn.run(app, host="127.0.0.1", port=cfg.port, access_log=False, server_header=False, proxy_headers=True,

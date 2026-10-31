@@ -123,8 +123,12 @@ The repository is not pushed anywhere, so copy a snapshot over SSH from the lapt
 git archive --format=tar remote | ssh ubuntu@<public-ip> \
   "sudo mkdir -p /opt/personal-finance-mcp && sudo tar -x -C /opt/personal-finance-mcp"
 ssh ubuntu@<public-ip>
-sudo bash /opt/personal-finance-mcp/deploy/setup.sh
+sudo UV_SHA256=<verified hash> bash /opt/personal-finance-mcp/deploy/setup.sh
 ```
+
+`setup.sh` refuses to install uv without `UV_SHA256`: the SHA-256 of `uv-aarch64-unknown-linux-gnu.tar.gz` (or the
+x86_64 one) for the uv version pinned in the script. Get it from a source other than the download itself, for example
+`gh attestation verify <file> --repo astral-sh/uv` on the laptop, and pass it as above or write it into the script.
 
 `setup.sh` does the following:
 - Installs Python 3.12 and uv.
@@ -196,6 +200,11 @@ X25519 with HKDF-SHA256 and AES-256-GCM, from the `cryptography` package that is
 `plaid_items_production` with `systemd-creds encrypt`, then deletes the one-time key, so a stray copy of the
 ciphertext is useless afterwards. If the key is lost or the import fails, run `bundle-key` again and re-export.
 
+**The moved item keeps its products.** It was linked when Link also asked for `transactions`, so its consent still
+covers cash and chequing activity, although the server never calls the Transactions endpoints. After the move, run
+the `health` tool from Claude (or `sudo pfmcp status`) and look at `products`. The only way to drop `transactions`
+is to relink, which uses another Trial slot.
+
 The laptop keeps its copy, so the local stdio server still works. Both copies are the same Plaid item, and
 `unlink` on either machine revokes it for both.
 
@@ -225,16 +234,20 @@ If the service fails to start with a `MemoryDenyWriteExecute` or `SystemCallFilt
 out that one line in `/etc/systemd/system/personal-finance-mcp.service`, run `sudo systemctl daemon-reload`, and
 restart. Keep the other sandbox lines.
 
-**Check that real client addresses arrive.** Per-IP limits need the client's address, which Funnel should pass in
-`X-Forwarded-For`. uvicorn trusts that header from 127.0.0.1 only. After the first requests from outside (the `curl`
-lines above, run from the laptop), look for this warning:
+**Deploy gate: check that real client addresses arrive.** Per-address limits need the client's address, which Funnel
+passes in `X-Forwarded-For`. uvicorn trusts that header from 127.0.0.1 only. Without it every caller would look like
+127.0.0.1, and a stranger could rate limit your sign-ins and tool calls. So the server refuses such requests: every
+request without a forwarded address gets `503 misconfigured_proxy`, except `/mcp` calls with a bearer token that
+authenticates (those are limited per OAuth client only). After the first requests from outside (the `curl` lines
+above, run from the laptop), check the journal:
 
 ```bash
-journalctl -u personal-finance-mcp | grep "forwarded client address"
+journalctl -u personal-finance-mcp | grep "misconfigured proxy"
 ```
 
-If the warning is there, Funnel did not send the address. Every request then shares one per-address bucket. That still
-works for one owner: a stranger's sign-ins cannot push out yours, and `/mcp` calls are limited per OAuth client.
+**If this appears, do not go live.** Fix the Funnel target to `http://127.0.0.1:8765` (`sudo tailscale funnel --bg
+8765`, then `tailscale funnel status`), restart the service and check again. `REQUIRE_FORWARDED_FOR=false` in the env
+file turns the check off; use it only to test the server directly on the VM, never behind Funnel.
 
 ## 8. Add the connector in Claude, with the one-time approval
 
@@ -267,6 +280,12 @@ works for one owner: a stranger's sign-ins cannot push out yours, and `/mcp` cal
    there. In a chat, turn it on from the **+** menu → **Connectors**. Under **Customize → Connectors** you can mark
    the tools **Always allow** or keep approving each call.
 
+**If adding the connector stalls.** Registration is public, so a flood of registrations from elsewhere can use up the
+per-network or daily registration limits, and adding or re-adding the connector then fails with "too many requests"
+for a while. An existing connection is not affected: its client is already registered and its calls are limited per
+client. Wait (the limits are per hour and per day), or run `sudo pfmcp list-clients` to see what registered, revoke
+anything that is not yours, and try again.
+
 Claude registers a new client whenever the connector is added again. Approve each one the same way, and revoke old
 ones with `sudo pfmcp revoke-client <fingerprint>`. Approved and revoked clients count toward a cap of 50
 (`list-clients` shows how many are used), and only revoking makes room. Pending ones expire after 30 minutes, and
@@ -285,7 +304,9 @@ at most 20 wait at once, the oldest giving way.
   - A code works once. Replaying it revokes the tokens it issued, and a wrong PKCE verifier destroys it.
   - Codes and tokens are stored only as HMAC digests keyed by the signing key.
 - **Limits:**
-  - Request bodies are capped at 64 KiB.
+  - Request bodies are capped at 64 KiB, and each chunk of a body must arrive within 10 seconds (else 408).
+  - At most 4 requests without a bearer token can be in flight at once from one address (else 429).
+  - Requests without a forwarded client address get 503 (see the deploy gate in step 7).
   - Rate limits come in two layers (over a limit gives 429). The model is in the `RateLimiter` docstring in
     `app/remote.py`.
     - **Layer 1, every request, before any database work:**

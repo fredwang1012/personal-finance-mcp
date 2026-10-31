@@ -21,9 +21,12 @@ fi
 echo "== packages"
 if command -v apt-get >/dev/null; then
     apt-get update -q
-    DEBIAN_FRONTEND=noninteractive apt-get install -yq python3.12 python3.12-venv curl ca-certificates
+    DEBIAN_FRONTEND=noninteractive apt-get install -yq python3.12 python3.12-venv ca-certificates
+    command -v curl >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -yq curl
 elif command -v dnf >/dev/null; then
-    dnf install -y python3.12 curl ca-certificates
+    dnf install -y python3.12 ca-certificates
+    # EL9 ships curl-minimal, which conflicts with the curl package; either one is fine
+    command -v curl >/dev/null || dnf install -y curl
 else
     echo "unsupported distribution (need apt-get or dnf)" >&2; exit 1
 fi
@@ -34,25 +37,27 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 
 echo "== uv $UV_VERSION"
-# The release tarball is checked against its published SHA-256 file instead of piping an installer into sh.
-# For a stronger pin, put the hash you verified once in UV_SHA256 below and it is checked instead.
-UV_SHA256="${UV_SHA256:-}"
+# REQUIRED: the SHA-256 of uv-<triple>.tar.gz for UV_VERSION, verified once from a source other than the download
+# itself (for example `gh attestation verify uv-<triple>.tar.gz --repo astral-sh/uv` on the laptop, or the hash in the
+# release notes compared on two machines). A .sha256 file from the same server would prove nothing, so none is used:
+# setup stops unless the hash for this machine's CPU is set here or passed in the environment.
+UV_SHA256_AARCH64="${UV_SHA256_AARCH64:-}"   # uv 0.13.5, aarch64-unknown-linux-gnu (Oracle Ampere): SET ME
+UV_SHA256_X86_64="${UV_SHA256_X86_64:-}"     # uv 0.13.5, x86_64-unknown-linux-gnu: SET ME
 if ! command -v uv >/dev/null || [[ "$(uv --version | awk '{print $2}')" != "$UV_VERSION" ]]; then
     case "$(uname -m)" in
-        x86_64) triple=x86_64-unknown-linux-gnu ;;
-        aarch64) triple=aarch64-unknown-linux-gnu ;;
+        x86_64) triple=x86_64-unknown-linux-gnu; UV_SHA256="${UV_SHA256:-$UV_SHA256_X86_64}" ;;
+        aarch64) triple=aarch64-unknown-linux-gnu; UV_SHA256="${UV_SHA256:-$UV_SHA256_AARCH64}" ;;
         *) echo "unsupported CPU $(uname -m)" >&2; exit 1 ;;
     esac
+    if [[ ! "${UV_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "UV_SHA256 for $triple is not set: verify the uv $UV_VERSION hash out of band and set it (see setup.sh)" >&2
+        exit 1
+    fi
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     base="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$triple.tar.gz"
     curl -fLsS -o "$tmp/uv.tar.gz" "$base"
-    if [[ -n "$UV_SHA256" ]]; then
-        echo "$UV_SHA256  $tmp/uv.tar.gz" | sha256sum -c -
-    else
-        curl -fLsS -o "$tmp/uv.tar.gz.sha256" "$base.sha256"
-        echo "$(awk '{print $1}' "$tmp/uv.tar.gz.sha256")  $tmp/uv.tar.gz" | sha256sum -c -
-    fi
+    echo "$UV_SHA256  $tmp/uv.tar.gz" | sha256sum -c -
     tar -xzf "$tmp/uv.tar.gz" -C "$tmp"
     install -m 0755 "$tmp/uv-$triple/uv" "$tmp/uv-$triple/uvx" /usr/local/bin/
     rm -rf "$tmp"
