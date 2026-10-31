@@ -256,3 +256,42 @@ def test_csv_error_in_one_file_does_not_abort_others(tmp_path, monkeypatch, caps
     assert main(["import-csv", str(bad), str(FIX / "activities_synthetic.csv")]) == 1
     out = capsys.readouterr().out
     assert "bad.csv: not imported (malformed CSV" in out and "added 7" in out
+
+
+def _mk(tmp_path, text, name="f.csv"):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+HOLD_HEAD = "Account Name,Account Number,Symbol,Name,Quantity,Market Price,Market Price Currency,Market Value,Book Value (Market),As Of\n"
+
+
+def test_split_lots_in_one_file_are_summed(conn, tmp_path):
+    path = _mk(tmp_path, HOLD_HEAD + "Fake TFSA,TEST-1111,ZZTEST,Fund,6,10,CAD,60,50,2024-03-31\n"
+                  "Fake TFSA,TEST-1111,ZZTEST,Fund,4,10,CAD,40.5,30,2024-03-31\n")
+    res = csvimport.import_file(path, conn)
+    assert (res.added, res.merged, res.rejected) == (1, 1, [])
+    assert conn.execute("SELECT quantity, market_value, book_value FROM holdings").fetchall() == [("10", "100.5", "80")]
+
+
+def test_split_lots_with_different_currencies_are_rejected(conn, tmp_path):
+    path = _mk(tmp_path, HOLD_HEAD + "Fake TFSA,TEST-1111,ZZTEST,Fund,6,10,CAD,60,50,2024-03-31\n"
+                  "Fake TFSA,TEST-1111,ZZTEST,Fund,4,10,USD,40,30,2024-03-31\n")
+    res = csvimport.import_file(path, conn)
+    assert res.rejected == [(3, "same position listed in different currencies")]
+    assert conn.execute("SELECT quantity, currency FROM holdings").fetchall() == [("6", "CAD")]
+
+
+def test_alphanumeric_account_column_reduced_to_last4(conn, tmp_path):
+    path = _mk(tmp_path, "Account,Symbol,Quantity,Market Price Currency\nAB-77-XYZ12,ZZTEST,1,CAD\n")
+    csvimport.import_file(path, conn)
+    name, mask = conn.execute("SELECT name, mask FROM accounts").fetchone()
+    assert mask == "YZ12" and "AB-77" not in name
+    assert "AB-77-XYZ12" not in "\n".join(conn.iterdump())
+
+
+def test_plain_uppercase_account_name_stays_a_name(conn, tmp_path):
+    path = _mk(tmp_path, "Account,Symbol,Quantity,Market Price Currency\nNON-REGISTERED,ZZTEST,1,CAD\n")
+    csvimport.import_file(path, conn)
+    assert conn.execute("SELECT name, mask FROM accounts").fetchone() == ("NON-REGISTERED", "")

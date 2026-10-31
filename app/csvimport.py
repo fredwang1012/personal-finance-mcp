@@ -69,6 +69,7 @@ TYPE_RES = [
 ]
 DIGIT_RUN = re.compile(r"\d(?:[ -]?\d){5,}")
 NUMBER_LIKE = re.compile(r"[\d \-]{6,}")
+IDENTIFIER_LIKE = re.compile(r"[A-Z0-9\-]{6,}")  # no spaces, no lower case: e.g. "AB-77-XYZ12"
 NUMERIC = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 
 
@@ -82,6 +83,7 @@ class ImportResult:
     added: int = 0
     updated: int = 0
     duplicates: int = 0
+    merged: int = 0  # holdings rows folded into an earlier row for the same (account, as-of, symbol) in one file
     rejected: list[tuple[int, str]] = field(default_factory=list)
 
 
@@ -186,11 +188,25 @@ def _hash(*parts: str) -> str:
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
 
 
+def _looks_like_number(text: str) -> bool:
+    if NUMBER_LIKE.fullmatch(text):
+        return True
+    # alphanumeric identifiers need several digits, so plain upper-case names such as "NON-REGISTERED" stay names
+    return bool(IDENTIFIER_LIKE.fullmatch(text)) and sum(ch.isdigit() for ch in text) >= 4
+
+
+def _add(a: str, b: str) -> str:
+    if not a and not b:
+        return ""
+    total = Decimal(a or 0) + Decimal(b or 0)
+    return "0" if total == 0 else format(total.normalize(), "f")
+
+
 def _account(row: dict[str, str]) -> tuple[str, str, str, str, str]:
     """Returns (id, name, type, last4, raw number); the raw number is only used to redact other fields."""
     number = _pick(row, "account_number")
     name_raw = _pick(row, "account_name")
-    if not number and NUMBER_LIKE.fullmatch(name_raw):
+    if not number and _looks_like_number(name_raw):
         number = name_raw  # an "Account" column that holds the number itself
     name = _text(name_raw, number)
     type_ = _text(_pick(row, "account_type"), number)
@@ -248,13 +264,14 @@ def import_file(path: Path, conn, now: datetime | None = None) -> ImportResult:
         if kind is None:
             raise ValueError("unrecognised Wealthsimple export format (see app/csvimport.py docstring)")
         result = ImportResult(kind=kind)
+        held: dict[tuple, tuple] = {}  # holdings seen in this file, so split lots can be combined
         seen: dict[str, int] = {}  # identical rows inside one file are real repeats (e.g. two equal fills)
         for line, values in records:
             if len(values) > len(headers):
                 result.rejected.append((line, "more cells than header columns"))
                 continue
             try:
-                _import_row(conn, kind, dict(zip(headers, values)), seen, result, file_sha, imported_at, now)
+                _import_row(conn, kind, dict(zip(headers, values)), seen, held, result, file_sha, imported_at, now)
             except RowError as exc:
                 result.rejected.append((line, str(exc)))
     except csv.Error:
@@ -267,7 +284,7 @@ def import_file(path: Path, conn, now: datetime | None = None) -> ImportResult:
     return result
 
 
-def _import_row(conn, kind, row, seen, result, file_sha, imported_at, now) -> None:
+def _import_row(conn, kind, row, seen, held, result, file_sha, imported_at, now) -> None:
     account = _account(row)
     number = account[4]
     currency = _pick(row, "currency").upper()
@@ -311,6 +328,16 @@ def _import_row(conn, kind, row, seen, result, file_sha, imported_at, now) -> No
         _decimal(_pick(row, "book_value"), "book value"),
         currency,
     )
+    key = (account[0], as_of, symbol)
+    previous = held.get(key)
+    if previous:
+        # a second lot of the same position in one file: combine rather than overwrite
+        if previous[5] != currency:
+            raise RowError("same position listed in different currencies")
+        values = (previous[0], _add(previous[1], values[1]), previous[2], _add(previous[3], values[3]),
+                  _add(previous[4], values[4]), currency)
+        result.merged += 1
+    held[key] = values
     _save_account(conn, account, imported_at, file_sha)
     existing = conn.execute(
         "SELECT name, quantity, price, market_value, book_value, currency FROM holdings"
@@ -320,6 +347,7 @@ def _import_row(conn, kind, row, seen, result, file_sha, imported_at, now) -> No
     if existing == values:
         result.duplicates += 1
         return
+    merged_row = previous is not None
     conn.execute(
         "INSERT INTO holdings (account_id, as_of, as_of_inferred, symbol, name, quantity, price, market_value,"
         " book_value, currency, source, imported_at, file_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,'csv',?,?)"
@@ -329,7 +357,9 @@ def _import_row(conn, kind, row, seen, result, file_sha, imported_at, now) -> No
         " imported_at=excluded.imported_at, file_sha256=excluded.file_sha256",
         (account[0], as_of, 0 if as_of_raw else 1, symbol, *values, imported_at, file_sha),
     )
-    if existing:
+    if merged_row:
+        pass  # already counted when the first lot was written
+    elif existing:
         result.updated += 1
     else:
         result.added += 1
@@ -358,6 +388,7 @@ def import_paths(paths: list[str]) -> int:
                 failed = True
                 continue
             updated = f", updated {res.updated}" if res.updated else ""
+            updated += f", merged {res.merged}" if res.merged else ""
             print(
                 f"{path.name} [{res.kind}]: added {res.added}{updated}, duplicates skipped {res.duplicates},"
                 f" rejected {len(res.rejected)}"
