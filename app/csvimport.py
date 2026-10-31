@@ -70,7 +70,7 @@ TYPE_RES = [
 DIGIT_RUN = re.compile(r"\d(?:[ -]?\d){5,}")
 NUMBER_LIKE = re.compile(r"[\d \-]{6,}")
 IDENTIFIER_LIKE = re.compile(r"[A-Za-z0-9\-]{6,}")  # no spaces, e.g. "AB-77-XYZ12"
-LABEL_LIKE = re.compile(r"[A-Za-z]{3,}(?:-?\d{1,4}){1,2}")  # e.g. "RRSP-2024-01", "TFSA2024"
+LABEL_LIKE = re.compile(r"[A-Za-z]{3,}-?\d{1,4}(?:-\d{1,4})?")  # e.g. "RRSP-2024-01", "TFSA2024"
 NUMERIC = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 
 

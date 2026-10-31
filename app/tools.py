@@ -90,11 +90,13 @@ class Backend:
 
     def clean(self, raw: Any) -> str:
         """Sanitise free text from Plaid and remove anything that looks like a token or a known id."""
-        out = TOKEN_RE.sub("[redacted]", _text(str(raw or "")))
-        for secret in (*self.tokens.values(), *self.tokens, *self._pids):
+        # redact on the raw string first: _text masks digit runs, which would hide a token from exact matching
+        out = str(raw or "")
+        for secret in sorted((*self.tokens.values(), *self.tokens, *self._pids), key=len, reverse=True):
             if secret:
                 out = out.replace(secret, "[redacted]")
-        return out
+        out = TOKEN_RE.sub("[redacted]", out)
+        return TOKEN_RE.sub("[redacted]", _text(out))
 
     def close(self) -> None:
         self.conn.close()

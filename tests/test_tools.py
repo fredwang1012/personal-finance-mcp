@@ -388,3 +388,18 @@ def test_run_error_path_returns_short_message(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "open_backend", fail)
     assert TOKEN_OK not in json.dumps(server._run(boom))
+
+
+def test_clean_redacts_known_secrets_before_digit_masking(csv_conn):
+    token = "access-production-1234567890-abcdef"
+    item = "item123456789"
+    b = tools.Backend(csv_conn, FakePlaid(), {item: token}, today=lambda: TODAY)
+    out = b.clean(f"failed for {token} on {item}")
+    assert "[redacted]" in out
+    assert "abcdef" not in out and "6789" not in out
+
+
+def test_label_with_long_digit_run_is_an_identifier():
+    from app import csvimport
+    assert csvimport._looks_like_number("ABC12345678")
+    assert not csvimport._looks_like_number("RRSP-2024-01")
