@@ -74,6 +74,7 @@ def make(tmp_path, uid=OWNER, limits=Limits(), public=PUBLIC, clock=None):
     clock = clock or Clock()
     cfg = RemoteConfig(public, 8765, OWNER, KEY, tmp_path / "remote")
     app, provider = build_app(cfg, FakeGitHub(uid), limits=limits, clock=clock, limiter=RateLimiter())
+    provider.approval_refresh = 0  # see CLI approvals at once instead of within a second
     return app, provider, clock
 
 
@@ -411,12 +412,13 @@ def test_markers_never_reach_http_output(remote, monkeypatch):
 # --- hardening ----------------------------------------------------------------------------------------------------
 
 def test_rate_limits_trip(tmp_path, plaid):
-    limits = Limits(register_ip=(2, 3600), token_client=(2, 60), mcp_client=(3, 60))
+    limits = Limits(register_addr=(2, 3600), token_addr=(3, 60), mcp_client=(3, 60))
     app, provider, _ = make(tmp_path, limits=limits)
     with TestClient(app, base_url=PUBLIC) as c:
         client_id, tokens = full_login(c, provider)  # one /register, one /token
-        r = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x", "client_id": client_id})
-        assert r.status_code == 400
+        for _ in range(2):
+            r = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x", "client_id": client_id})
+            assert r.status_code == 400
         r = c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x", "client_id": client_id})
         assert r.status_code == 429 and int(r.headers["retry-after"]) >= 1
         register(c, provider)
@@ -529,7 +531,7 @@ def test_revoked_client_tokens_rejected(remote):
 
 
 def test_expired_pending_clients_are_purged_and_capped(tmp_path, plaid):
-    app, provider, clock = make(tmp_path, limits=Limits(register_ip=(100, 3600), register_global=(100, 86400)))
+    app, provider, clock = make(tmp_path, limits=Limits(register_addr=(100, 3600), register_global=(100, 86400)))
     with TestClient(app, base_url=PUBLIC) as client:
         _purge_and_cap(client, provider, clock)
     provider.close()
@@ -550,7 +552,7 @@ def _purge_and_cap(client, provider, clock):
 
 
 def test_register_rate_limit(tmp_path, plaid):
-    app, provider, _ = make(tmp_path, limits=Limits(register_ip=(2, 3600)))
+    app, provider, _ = make(tmp_path, limits=Limits(register_addr=(2, 3600)))
     with TestClient(app, base_url=PUBLIC) as c:
         register(c)
         register(c)
@@ -623,8 +625,8 @@ def test_parked_login_is_bound_to_the_browser(remote):
 
 
 def test_flood_of_pending_clients_cannot_block_owner_login(tmp_path, plaid):
-    loose = Limits(per_ip=(10_000, 60), register_ip=(10_000, 3600), register_global=(10_000, 86400),
-                   login_ip=(10_000, 60))
+    loose = Limits(per_addr=(10_000, 60), register_addr=(10_000, 3600), register_global=(10_000, 86400),
+                   login_addr=(10_000, 60))
     app, provider, _ = make(tmp_path, limits=loose)
     with TestClient(app, base_url=PUBLIC) as owner:
         client_id = register(owner, provider)["client_id"]
@@ -651,8 +653,8 @@ def test_logins_per_client_are_capped(remote):
     assert client.get(GITHUB_CALLBACK_PATH, params={"code": "gh", "state": states[2]}).status_code == 200
 
 
-def test_authenticated_mcp_is_exempt_from_per_ip_limit(tmp_path, plaid):
-    limits = Limits(per_ip=(30, 60), mcp_unauthenticated_ip=(2, 60))
+def test_unauthenticated_mcp_has_its_own_address_limit(tmp_path, plaid):
+    limits = Limits(per_addr=(1000, 60), mcp_anonymous_addr=(2, 60))
     app, provider, _ = make(tmp_path, limits=limits)
     with TestClient(app, base_url=PUBLIC) as c:
         _, tokens = full_login(c, provider)
@@ -705,50 +707,173 @@ def test_basic_auth_client_id_is_parsed_for_rate_limits():
     assert _basic_client_id(b"Bearer x") == "" and _basic_client_id(b"Basic !!!") == ""
 
 
-def test_rate_limiter_reclaims_idle_buckets_only(monkeypatch):
-    now = [0.0]
-    limiter = RateLimiter(clock=lambda: now[0])
-    monkeypatch.setattr(RateLimiter, "SWEEP_EVERY", 10)
-    for i in range(100):
-        limiter.hit(f"k{i}", (5, 60))
-    limiter.hit("slow", (5, 3600))
-    now[0] = 61
-    for i in range(10):
-        limiter.hit(f"fresh{i}", (5, 60))
-    assert set(limiter.hits) == {"slow"} | {f"fresh{i}" for i in range(10)}  # idle reclaimed, live "slow" kept
+# --- rate limiting regression suite (see app.remote.RateLimiter for the model) -------------------------------------
+
+def refresh(client, client_id, refresh_token):
+    return client.post("/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token,
+                                        "client_id": client_id, "resource": RESOURCE})
 
 
-def test_key_flood_cannot_reset_caps(monkeypatch):
-    now = [0.0]
-    limiter = RateLimiter(clock=lambda: now[0])
-    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 50)
-    global_rule, per_key = (5, 3600), (3, 60)
-    assert all(limiter.hit_global("register", global_rule) is None for _ in range(5))
-    assert limiter.hit_global("register", global_rule)  # cap reached
-    for _ in range(3):
-        assert limiter.hit("victim", per_key) is None
-    assert limiter.hit("victim", per_key)  # live bucket at its limit
-    # 10x MAX_KEYS distinct keys (rotating addresses or client ids)
-    results = [limiter.hit(f"junk{i}", per_key) for i in range(500)]
-    assert len(limiter.hits) <= 50
-    assert sum(r is None for r in results) <= 49 + RateLimiter.OVERFLOW_RULE[0]  # extra keys share the overflow cap
-    assert limiter.hit_global("register", global_rule)  # the global cap still holds
-    assert limiter.hit("victim", per_key)  # and the live per-key bucket survived the flood
-    now[0] = 61
-    assert limiter.hit("newcomer", per_key) is None  # once idle, junk buckets are reclaimed and room returns
-
-
-def test_junk_client_ids_do_not_reset_the_token_cap(tmp_path, plaid):
-    limits = Limits(per_ip=(10_000, 60), token_global=(5, 60), token_client=(100, 60))
-    app, provider, _ = make(tmp_path, limits=limits)
-    with TestClient(app, base_url=PUBLIC) as c:
-        codes = [c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x",
-                                         "client_id": f"junk-{i}"}).status_code for i in range(20)]
-        assert codes[:5].count(429) == 0 and set(codes[5:]) == {429}
-        limiter = c.app.limiter
-        every_key = [*limiter.hits, *limiter.client_hits, *limiter.global_hits]
-        assert not [k for k in every_key if "junk" in k]  # junk ids are counted per network, not per id
+def test_forged_approved_client_id_on_token_is_still_capped(tmp_path, plaid):
+    app, provider, _ = make(tmp_path, limits=Limits(token_addr=(5, 60)))
+    with TestClient(app, base_url=PUBLIC) as owner:
+        client_id, tokens = full_login(owner, provider)
+        client_bucket = owner.app.limiter.clients.buckets[f"token:{client_id}"]
+        before = list(client_bucket)  # the owner's own code exchange, counted after authentication
+        attacker = TestClient(app, base_url=PUBLIC, client=("198.51.100.66", 4000))
+        codes = [refresh(attacker, client_id, "pfm_rt_guessed").status_code for _ in range(8)]
+        assert codes[:5] == [400] * 5 and set(codes[5:]) == {429}  # the approved id buys the attacker nothing
+        assert client_bucket == before  # forged requests never touched the client's bucket
+        assert refresh(owner, client_id, tokens["refresh_token"]).status_code == 200  # owner unaffected
     provider.close()
+
+
+def test_conflicting_or_duplicate_client_id_rejected(remote):
+    import base64
+
+    client, provider, _ = remote
+    form = {"grant_type": "refresh_token", "refresh_token": "x"}
+    r = client.post("/token", content="grant_type=refresh_token&refresh_token=x&client_id=a&client_id=b",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 400 and "more than once" in r.json()["error_description"]
+    basic = {"Authorization": "Basic " + base64.b64encode(b"b:secret").decode()}
+    r = client.post("/token", data={**form, "client_id": "a"}, headers=basic)
+    assert r.status_code == 400 and "more than once" in r.json()["error_description"]
+    r = client.post("/token", data={**form, "client_id": "b"}, headers=basic)  # same id twice is consistent
+    assert "more than once" not in r.text
+
+
+def test_neighbour_on_same_network_does_not_use_up_owner_login(tmp_path, plaid):
+    app, provider, _ = make(tmp_path, limits=Limits(login_addr=(3, 60)))
+    with TestClient(app, base_url=PUBLIC) as setup:
+        client_id = register(setup, provider)["client_id"]
+    neighbour = TestClient(app, base_url=PUBLIC, client=("203.0.113.9", 4000))
+    owner = TestClient(app, base_url=PUBLIC, client=("203.0.113.10", 4000))  # same /24
+    codes = [start_login(neighbour, client_id, "v" * 50).status_code for _ in range(5)]
+    assert codes[:3] == [302] * 3 and set(codes[3:]) == {429}
+    assert start_login(owner, client_id, "v" * 50).status_code == 302
+    provider.close()
+
+
+def test_anonymous_flood_keeps_register_cap_and_owner_traffic(tmp_path, plaid, monkeypatch):
+    monkeypatch.setattr(RateLimiter, "MAX_ADDR_KEYS", 20)
+    monkeypatch.setattr(RateLimiter, "MAX_NET_KEYS", 20)
+    app, provider, _ = make(tmp_path, limits=Limits(register_global=(5, 86400)))
+    with TestClient(app, base_url=PUBLIC) as owner:
+        client_id, tokens = full_login(owner, provider)
+        limiter = owner.app.limiter
+        for i in range(200):  # 10x the table sizes: distinct networks and addresses
+            stranger = TestClient(app, base_url=PUBLIC, client=(f"10.{i // 250}.{i % 250}.9", 4000))
+            stranger.get("/.well-known/oauth-authorization-server")
+            if i % 20 == 0:
+                stranger.post("/register", json={"redirect_uris": [CB]})
+        assert len(limiter.addr.buckets) <= 20 and len(limiter.net.buckets) <= 20  # live buckets kept, none added
+        assert limiter.take([(None, "overflow", limiter.OVERFLOW_RULE)])  # the shared overflow is drained
+        assert limiter.globals["register"][1] <= 5  # never reset; new networks were refused before reaching it
+        r = refresh(owner, client_id, tokens["refresh_token"])
+        assert r.status_code == 200
+        assert rpc(owner, r.json()["access_token"], "tools/list").status_code == 200
+        # the owner arriving from a brand-new network during the flood still gets authenticated calls through
+        roaming = TestClient(app, base_url=PUBLIC, client=("198.51.100.77", 4000))
+        r = refresh(roaming, client_id, r.json()["refresh_token"])
+        assert r.status_code == 200
+        assert rpc(roaming, r.json()["access_token"], "tools/list").status_code == 200
+    provider.close()
+
+
+def test_one_address_at_its_register_cap_spends_no_global_quota(tmp_path, plaid):
+    app, provider, _ = make(tmp_path, limits=Limits(register_addr=(2, 3600), register_global=(3, 86400)))
+    with TestClient(app, base_url=PUBLIC) as first:
+        register(first)
+        register(first)
+        for _ in range(10):
+            assert first.post("/register", json={"redirect_uris": [CB]}).status_code == 429
+        other = TestClient(app, base_url=PUBLIC, client=("198.51.100.4", 4000))
+        r = other.post("/register", json={"redirect_uris": [CB], "token_endpoint_auth_method": "none"})
+        assert r.status_code == 201  # the third global slot was still free
+        third = TestClient(app, base_url=PUBLIC, client=("192.0.2.4", 4000))
+        assert third.post("/register", json={"redirect_uris": [CB]}).status_code == 429  # global cap reached
+    provider.close()
+
+
+class DbSpy:
+    def __init__(self, db):
+        self.db, self.calls = db, 0
+
+    def execute(self, *args, **kwargs):
+        self.calls += 1
+        return self.db.execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+
+def test_no_database_work_before_layer1_passes(tmp_path, plaid):
+    app, provider, _ = make(tmp_path, limits=Limits(per_addr=(3, 60)))
+    with TestClient(app, base_url=PUBLIC) as c:
+        spy = provider.db = DbSpy(provider.db)
+        for _ in range(3):
+            c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x", "client_id": "junk"})
+        assert spy.calls > 0  # requests that passed layer 1 did reach the database
+        spy.calls = 0
+        assert c.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x",
+                                      "client_id": "junk"}).status_code == 429
+        assert c.post("/register", json={"redirect_uris": [CB]}).status_code == 429
+        assert c.get("/authorize", params={"client_id": "x"}).status_code == 429
+        assert c.post("/mcp", json={}, headers={**MCP_HEADERS, "Authorization": "Bearer pfm_at_x"}).status_code == 429
+        assert spy.calls == 0
+    provider.close()
+
+
+def test_token_rate_limit_counts_only_authenticated_grants(tmp_path, plaid):
+    app, provider, _ = make(tmp_path, limits=Limits(token_client=(2, 60)))
+    with TestClient(app, base_url=PUBLIC) as c:
+        client_id, tokens = full_login(c, provider)  # the code exchange is grant 1
+        for _ in range(5):  # failed grants do not count against the client
+            assert refresh(c, client_id, "pfm_rt_wrong").json()["error"] == "invalid_grant"
+        second = refresh(c, client_id, tokens["refresh_token"])
+        assert second.status_code == 200  # grant 2
+        r = refresh(c, client_id, second.json()["refresh_token"])
+        assert r.status_code == 400 and "Too many token requests" in r.json()["error_description"]
+        # refused before anything was consumed: that refresh token is still unused
+        assert provider._row(second.json()["refresh_token"], "refresh")["used_at"] is None
+    provider.close()
+
+
+def test_live_buckets_survive_and_idle_ones_are_reclaimed():
+    now = [0.0]
+    limiter = RateLimiter(clock=lambda: now[0])
+    limiter.addr.max_keys = 5
+    rules = Limits(per_addr=(100, 60), per_net=(1000, 60))
+    for i in range(5):
+        limiter.layer1(f"192.0.2.{i}", None, rules, False)
+    live = set(limiter.addr.buckets)
+    for i in range(50):  # table full of live buckets: newcomers are limited by their network bucket only
+        assert limiter.layer1(f"198.51.100.{i}", None, rules, False)[0] is None
+    assert set(limiter.addr.buckets) == live
+    now[0] = 121  # two windows later the old buckets no longer count and are reclaimed on demand
+    limiter.layer1("203.0.113.1", None, rules, False)
+    assert set(limiter.addr.buckets) == {"a:203.0.113.1"}
+
+
+def test_full_table_sweep_is_throttled(monkeypatch):
+    from app import remote
+
+    now = [0.0]
+    limiter = RateLimiter(clock=lambda: now[0])
+    limiter.addr.max_keys = 3
+    sweeps = []
+    original = remote._Table.sweep
+    monkeypatch.setattr(remote._Table, "sweep", lambda self, t: (sweeps.append(t), original(self, t)))
+    rules = Limits()
+    for i in range(3):
+        limiter.layer1(f"192.0.2.{i}", None, rules, False)
+    for i in range(100):
+        limiter.layer1(f"198.51.100.{i}", None, rules, False)
+    assert len([t for t in sweeps if t == 0.0]) == 1
+    now[0] = 2.0
+    limiter.layer1("203.0.113.5", None, rules, False)
+    assert len(sweeps) == 2
 
 
 def test_ip_buckets_aggregate_networks():
@@ -757,58 +882,6 @@ def test_ip_buckets_aggregate_networks():
     assert ip_bucket("203.0.113.7") == ip_bucket("203.0.113.250") == "203.0.113.0/24"
     assert ip_bucket("2001:db8:1:2::5") == ip_bucket("2001:db8:1:2:ffff::1") == "2001:db8:1:2::/64"
     assert ip_bucket("testclient") == "testclient"
-
-
-def test_anonymous_key_flood_cannot_block_the_owner(tmp_path, plaid, monkeypatch):
-    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 20)
-    limits = Limits(token_global=(1000, 60))
-    app, provider, _ = make(tmp_path, limits=limits)
-    with TestClient(app, base_url=PUBLIC) as owner:
-        client_id, tokens = full_login(owner, provider)
-        limiter = owner.app.limiter
-        # 10x MAX_KEYS distinct networks: fills the anonymous map, then drains the shared overflow bucket
-        for i in range(200):
-            stranger = TestClient(app, base_url=PUBLIC, client=(f"10.{i // 250}.{i % 250}.9", 4000))
-            stranger.get("/.well-known/oauth-authorization-server")
-        assert len(limiter.hits) <= 20 and limiter.hit("brand-new", (5, 60))  # overflow really is drained
-        r = owner.post("/token", data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
-                                       "client_id": client_id, "resource": RESOURCE})
-        assert r.status_code == 200
-        assert rpc(owner, r.json()["access_token"], "tools/list").status_code == 200
-    provider.close()
-
-
-def test_one_network_at_its_register_cap_spends_no_global_quota(tmp_path, plaid):
-    limits = Limits(register_ip=(2, 3600), register_global=(3, 86400))
-    app, provider, _ = make(tmp_path, limits=limits)
-    with TestClient(app, base_url=PUBLIC) as first:
-        register(first)
-        register(first)
-        for _ in range(10):  # over its own cap: refused, and must not touch the daily total
-            assert first.post("/register", json={"redirect_uris": [CB]}).status_code == 429
-        other = TestClient(app, base_url=PUBLIC, client=("198.51.100.4", 4000))
-        r = other.post("/register", json={"redirect_uris": [CB], "token_endpoint_auth_method": "none"})
-        assert r.status_code == 201  # the third and last global slot was still free
-        third = TestClient(app, base_url=PUBLIC, client=("192.0.2.4", 4000))
-        assert third.post("/register", json={"redirect_uris": [CB]}).status_code == 429  # global cap reached
-    provider.close()
-
-
-def test_full_map_sweep_is_rate_limited(monkeypatch):
-    now = [0.0]
-    limiter = RateLimiter(clock=lambda: now[0])
-    monkeypatch.setattr(RateLimiter, "MAX_KEYS", 5)
-    sweeps = []
-    original = RateLimiter._sweep
-    monkeypatch.setattr(RateLimiter, "_sweep", staticmethod(lambda table, t: (sweeps.append(t), original(table, t))))
-    for i in range(5):
-        limiter.hit(f"live{i}", (5, 60))
-    for i in range(100):  # map full of live keys: new keys go to overflow without a scan each time
-        limiter.hit(f"new{i}", (5, 60))
-    assert len(sweeps) == 1
-    now[0] = 2.0
-    limiter.hit("later", (5, 60))
-    assert len(sweeps) == 2
 
 
 def test_missing_forwarded_address_is_warned_once(tmp_path, plaid, caplog):

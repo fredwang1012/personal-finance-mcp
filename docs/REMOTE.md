@@ -233,7 +233,7 @@ lines above, run from the laptop), look for this warning:
 journalctl -u personal-finance-mcp | grep "forwarded client address"
 ```
 
-If the warning is there, Funnel did not send the address. Every request then shares one per-IP bucket. That still
+If the warning is there, Funnel did not send the address. Every request then shares one per-address bucket. That still
 works for one owner: a stranger's sign-ins cannot push out yours, and `/mcp` calls are limited per OAuth client.
 
 ## 8. Add the connector in Claude, with the one-time approval
@@ -286,13 +286,22 @@ at most 20 wait at once, the oldest giving way.
   - Codes and tokens are stored only as HMAC digests keyed by the signing key.
 - **Limits:**
   - Request bodies are capped at 64 KiB.
-  - Rate limits (over the limit gives 429):
-    - 10 registrations per IP per hour, 200 a day in total;
-    - 30 token requests per client per minute;
-    - 120 MCP requests per OAuth client per minute, and 60 per IP per minute for requests without a valid token;
-    - 300 other requests per IP per minute.
-  - Sign-ins in progress are capped at 2 per client, 5 per IP and 50 in total. A stranger's sign-ins never push out
-    one for an approved client.
+  - Rate limits come in two layers (over a limit gives 429). The model is in the `RateLimiter` docstring in
+    `app/remote.py`.
+    - **Layer 1, every request, before any database work:**
+      - 600 requests per minute per exact address, plus a per-endpoint limit for that address: 10 registrations an
+        hour, 30 sign-in requests a minute, 60 token requests a minute.
+      - A flood backstop of 6000 a minute per network (/24 or /64). Neighbours on a shared network never share the
+        per-address limits.
+    - **Global:** 200 registrations a day in total, counted only after the address passed its own limit.
+    - **Layer 2, only after authentication:**
+      - 120 MCP requests a minute per OAuth client, and 60 a minute per address for MCP requests without a valid
+        token.
+      - 30 successful token grants a minute per client.
+
+      A `client_id` that has not been authenticated never selects a bucket.
+  - Sign-ins in progress are capped at 2 per client, 5 per address and 50 in total. A stranger's sign-ins never push
+    out one for an approved client.
 - **Errors:** clients see only a short error code, never a traceback. The access log is off because query strings
   carry OAuth state and GitHub codes.
 

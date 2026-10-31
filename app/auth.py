@@ -295,6 +295,17 @@ class OwnerOAuthProvider:
         self._used_codes: dict[str, dict] = {}  # code digest -> token family it issued (replay detection)
         self._holds: dict[str, dict] = {}     # hold id -> owner login parked until the client is approved
         self._seq = itertools.count()          # arrival order, for evicting the oldest when times tie
+        # approved client ids, kept in memory. approve-client / revoke-client run in another process, so the set is
+        # reloaded when SQLite reports another connection changed the database (PRAGMA data_version), checked at
+        # most once per APPROVAL_REFRESH seconds; a revocation reaches a running server within that time.
+        self.approval_refresh = 1.0
+        self._approved_ids: frozenset[str] = frozenset()
+        self._data_version = None
+        self._approvals_checked = float("-inf")
+        self._last_purge = float("-inf")
+        # layer 2 rate limit for /token, installed by app.remote; returns seconds to wait or None
+        self.client_rate_limit: Callable[[str], int | None] = lambda client_id: None
+        self.refresh_approvals(force=True)
 
     # --- helpers ------------------------------------------------------------------------------------------------
 
@@ -324,22 +335,43 @@ class OwnerOAuthProvider:
 
     # --- clients (dynamic registration) -------------------------------------------------------------------------
 
-    def _client_row(self, client_id: str):
-        """(status, created_at) of a client, or None. Expired pending clients are purged first."""
+    def refresh_approvals(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._approvals_checked < self.approval_refresh:
+            return
+        self._approvals_checked = now
         with self._lock:
-            purge_clients(self.db, self.clock())
-            return self.db.execute("SELECT status, created_at FROM clients WHERE client_id = ?",
-                                   (client_id,)).fetchone()
+            version = self.db.execute("PRAGMA data_version").fetchone()[0]
+            if force or version != self._data_version:
+                rows = self.db.execute("SELECT client_id FROM clients WHERE status = 'approved'").fetchall()
+                self._approved_ids, self._data_version = frozenset(r[0] for r in rows), version
+
+    def _maybe_purge(self) -> None:
+        """Purging is housekeeping, not a check: at most once a minute. Expiry itself is enforced in the queries."""
+        now = self.clock()
+        if now - self._last_purge >= 60:
+            self._last_purge = now
+            with self._lock:
+                purge_clients(self.db, now)
+
+    def _client_row(self, client_id: str):
+        """(status, created_at) of a live client, or None; a pending client past its expiry counts as gone."""
+        self._maybe_purge()
+        with self._lock:
+            return self.db.execute(
+                "SELECT status, created_at FROM clients WHERE client_id = ? AND NOT (status = 'pending' AND "
+                "created_at < ?)", (client_id, self.clock() - PENDING_CLIENT_TTL)).fetchone()
 
     def _approved(self, client_id: str) -> bool:
-        row = self._client_row(client_id)
-        return row is not None and row[0] == "approved"
+        self.refresh_approvals()
+        return client_id in self._approved_ids
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        self._maybe_purge()
         with self._lock:
-            purge_clients(self.db, self.clock())
-            row = self.db.execute("SELECT metadata FROM clients WHERE client_id = ? AND status != 'revoked'",
-                                  (client_id,)).fetchone()
+            row = self.db.execute(
+                "SELECT metadata FROM clients WHERE client_id = ? AND status != 'revoked' AND NOT "
+                "(status = 'pending' AND created_at < ?)", (client_id, self.clock() - PENDING_CLIENT_TTL)).fetchone()
         if row is None:  # unknown or revoked: the token endpoint answers invalid_client, so Claude re-registers
             return None
         info = OAuthClientInformationFull.model_validate_json(row[0])
@@ -590,7 +622,14 @@ class OwnerOAuthProvider:
         with self._lock:
             self.db.execute("DELETE FROM tokens WHERE family = ?", (family,))
 
+    def _limit_client(self, client_id: str) -> None:
+        """Layer 2 rate limit: reached only after the SDK authenticated the client and validated the grant, and
+        checked before anything is consumed, so a refused request can simply be retried."""
+        if self.client_rate_limit(client_id):
+            raise TokenError("invalid_request", "Too many token requests for this client; try again in a minute.")
+
     async def exchange_authorization_code(self, client: OAuthClientInformationFull, authorization_code) -> OAuthToken:
+        self._limit_client(client.client_id)
         with self._lock:  # pop first, so a code can be redeemed once even under concurrent requests
             entry = self._codes.pop(self._digest("code", authorization_code.code), None)
         if entry is None or not self._approved(client.client_id):
@@ -619,6 +658,7 @@ class OwnerOAuthProvider:
                             expires_at=int(row["expires_at"]), resource=row["resource"], subject=row["subject"])
 
     async def exchange_refresh_token(self, client: OAuthClientInformationFull, refresh_token, scopes) -> OAuthToken:
+        self._limit_client(client.client_id)
         row = self._row(refresh_token.token, "refresh")
         if row is None:
             raise TokenError("invalid_grant", "refresh token does not exist")

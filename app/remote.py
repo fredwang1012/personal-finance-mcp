@@ -1,8 +1,9 @@
 """Remote connector: the same read-only tools over MCP Streamable HTTP, behind OAuth (python -m app.cli serve-http).
 
 Binds 127.0.0.1 only; Tailscale Funnel forwards public HTTPS to it. Every MCP request needs a bearer token issued by
-app.auth for this exact resource URL. Around the SDK's app sit a body-size cap, per-client rate limits, an audit log
-of tool names (never arguments or results) and an error guard that never returns a traceback.
+app.auth for this exact resource URL. Around the SDK's app sit a body-size cap, two-layer rate limits (see
+RateLimiter), an audit log of tool names (never arguments or results) and an error guard that never returns a
+traceback.
 """
 import base64
 import ipaddress
@@ -10,7 +11,6 @@ import json
 import logging
 import time
 import urllib.parse
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -45,20 +45,20 @@ TOOL_NAMES = frozenset(fn.__name__ for fn, _ in server.TOOLS)
 
 @dataclass(frozen=True)
 class Limits:
-    """(requests, window seconds) per key."""
-    per_ip: tuple[int, int] = (300, 60)
-    register_ip: tuple[int, int] = (10, 3600)
-    register_global: tuple[int, int] = (200, 86400)  # pending clients are capped and expire, so this can be loose
-    token_client: tuple[int, int] = (30, 60)
-    token_global: tuple[int, int] = (120, 60)
-    login_ip: tuple[int, int] = (30, 60)
-    mcp_client: tuple[int, int] = (120, 60)
-    mcp_unauthenticated_ip: tuple[int, int] = (60, 60)
+    """(requests, window seconds) per bucket. See RateLimiter for where each one applies."""
+    per_addr: tuple[int, int] = (600, 60)          # layer 1, every request, exact client address
+    per_net: tuple[int, int] = (6000, 60)          # layer 1, every request, /24 or /64: flood backstop only
+    register_addr: tuple[int, int] = (10, 3600)    # layer 1, POST /register, exact address
+    login_addr: tuple[int, int] = (30, 60)         # layer 1, /authorize and /oauth/*, exact address
+    token_addr: tuple[int, int] = (60, 60)         # layer 1, POST /token, exact address
+    register_global: tuple[int, int] = (200, 86400)  # global, after layer 1 passed
+    mcp_client: tuple[int, int] = (120, 60)        # layer 2, authenticated /mcp, per OAuth client
+    token_client: tuple[int, int] = (30, 60)       # layer 2, /token grant that passed the SDK's checks
+    mcp_anonymous_addr: tuple[int, int] = (60, 60)  # layer 2, /mcp without a valid token, exact address
 
 
 def ip_bucket(ip: str) -> str:
-    """Anonymous limits count per network, not per address: /24 for IPv4, /64 for IPv6, so one host cannot mint
-    new keys by rotating addresses within its own allocation."""
+    """The network an address belongs to for the flood backstop: /24 for IPv4, /64 for IPv6."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -66,81 +66,118 @@ def ip_bucket(ip: str) -> str:
     return str(ipaddress.ip_network(f"{addr}/{24 if addr.version == 4 else 64}", strict=False))
 
 
-class RateLimiter:
-    """Sliding-window counters in memory. Restarting the service resets them, which is acceptable for one owner.
+# A bucket is [window_start, count_this_window, count_previous_window, window]: an approximate sliding window in
+# constant memory (the previous window's count is weighted by how much of it still overlaps).
+def _roll(b: list, now: float) -> None:
+    if now >= b[0] + b[3]:
+        windows = int((now - b[0]) // b[3])
+        b[2] = b[1] if windows == 1 else 0
+        b[1] = 0
+        b[0] += windows * b[3]
 
-    Three maps, so no traffic in one can push out or drain another:
-    - global (`hit_global`): caps over everyone together; never evicted.
-    - client (`hit_client`): approved OAuth clients (`mcp:{client}`, `token:{client}`); bounded by the number of
-      clients, never routed to the overflow bucket.
-    - anonymous (`hit`): per-network keys. Buckets are reclaimed only once idle for longer than their window; a
-      live bucket is never dropped. When the map is full, new anonymous keys share one strict overflow bucket.
-      The full-map sweep runs at most once per SWEEP_INTERVAL seconds, so a flood cannot make every request scan.
+
+def _retry_after(b: list, limit: int, now: float) -> int | None:
+    _roll(b, now)
+    estimate = b[2] * (1 - (now - b[0]) / b[3]) + b[1]
+    return max(1, int(b[0] + b[3] - now) + 1) if estimate >= limit else None
+
+
+class _Table:
+    """Per-key buckets. A bucket is dropped only once idle for two windows (it then no longer affects anything);
+    a live bucket is never evicted. When full, `room_for` says no for new keys and the caller decides."""
+
+    def __init__(self, max_keys: int):
+        self.max_keys, self.buckets, self._last_sweep = max_keys, {}, float("-inf")
+
+    def sweep(self, now: float) -> None:
+        for key in [k for k, b in self.buckets.items() if now >= b[0] + 2 * b[3]]:
+            del self.buckets[key]
+        self._last_sweep = now
+
+    def room_for(self, key: str, now: float, sweep_interval: float) -> bool:
+        if key in self.buckets or len(self.buckets) < self.max_keys:
+            return True
+        if now - self._last_sweep >= sweep_interval:  # throttled: a flood cannot make every request scan
+            self.sweep(now)
+        return len(self.buckets) < self.max_keys
+
+
+class RateLimiter:
+    """Rate limiting model for the remote connector.
+
+    Layer 1, before anything else and with no database work, on every request (/token and /mcp included):
+      - an exact per-address bucket (generous; never shared with neighbours) plus, for /register, /authorize and
+        /oauth/*, and /token, an exact per-address bucket for that endpoint;
+      - a per-network bucket (/24, /64) with a much higher limit, only as a flood backstop.
+      Address and network buckets live in separate tables, so neither can drain or push out the other. All are
+      checked first and recorded only if every one passes. If the address table is full, a new address is limited
+      by its network bucket alone. If the network table is full, a new network shares one strict overflow bucket,
+      except on /mcp and /token, which go on to layer 2 (so a flood cannot starve the owner's authenticated calls;
+      their failures are then counted against the overflow bucket afterwards).
+    Global caps (registrations per day) are counted only after layer 1 passed; they are never evicted.
+    Layer 2, only once the SDK has authenticated the request, keyed by the authenticated OAuth client:
+      - /mcp with a valid bearer token: per-client bucket (ClientRateLimit). Without one: an exact per-address
+        bucket.
+      - /token: per-client bucket counted by the provider in exchange_*, i.e. after client authentication, grant
+        lookup and PKCE. Nothing is ever routed on an unauthenticated client_id.
+    Logins in progress are capped separately in app.auth (per client, per address, in total).
     """
 
-    MAX_KEYS = 10000
+    MAX_ADDR_KEYS = 100_000
+    MAX_NET_KEYS = 50_000
     MAX_CLIENT_KEYS = 1000
-    OVERFLOW_RULE = (30, 60)
-    SWEEP_EVERY = 1000
+    OVERFLOW_RULE = (60, 60)
     SWEEP_INTERVAL = 1.0
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
-        self.hits: dict[str, tuple[deque, int]] = {}          # anonymous: key -> (timestamps, window)
-        self.client_hits: dict[str, tuple[deque, int]] = {}   # approved OAuth clients
-        self.global_hits: dict[str, tuple[deque, int]] = {}   # never evicted
-        self._since_sweep = 0
-        self._last_sweep = float("-inf")
+        self.addr, self.net = _Table(self.MAX_ADDR_KEYS), _Table(self.MAX_NET_KEYS)
+        self.clients = _Table(self.MAX_CLIENT_KEYS)
+        self.globals: dict[str, list] = {}  # never evicted
 
-    @staticmethod
-    def _sweep(table: dict, now: float) -> None:
-        for key in [k for k, (q, window) in table.items() if not q or q[-1] <= now - window]:
-            del table[key]
-
-    @staticmethod
-    def _over(table: dict, key: str, rule: tuple[int, int], now: float) -> int | None:
-        """Seconds to wait if `key` is at its limit, else None; records nothing."""
-        limit, window = rule
-        q = table.get(key, (deque(), window))[0]
-        while q and q[0] <= now - window:
-            q.popleft()
-        return max(1, int(q[0] + window - now) + 1) if len(q) >= limit else None
-
-    @staticmethod
-    def _record(table: dict, key: str, rule: tuple[int, int], now: float) -> None:
-        table.setdefault(key, (deque(), rule[1]))[0].append(now)
-
-    def _count(self, table: dict, key: str, rule: tuple[int, int], now: float) -> int | None:
-        retry = self._over(table, key, rule, now)
-        if retry is None:
-            self._record(table, key, rule, now)
-        return retry
-
-    def hit_global(self, key: str, rule: tuple[int, int]) -> int | None:
-        """A cap over all clients together. Call it after the per-key checks passed, so one key that is already
-        at its own limit cannot spend the shared quota."""
-        return self._count(self.global_hits, key, rule, self.clock())
-
-    def hit_client(self, key: str, rule: tuple[int, int]) -> int | None:
-        """A cap for one approved OAuth client."""
+    def take(self, specs: list[tuple["_Table | None", str, tuple[int, int]]]) -> int | None:
+        """Check every (table, key, rule) bucket (table None = global) and record in all of them only if every one
+        passes. Returns seconds to wait, or None."""
         now = self.clock()
-        if key not in self.client_hits and len(self.client_hits) >= self.MAX_CLIENT_KEYS:
-            self._sweep(self.client_hits, now)
-        return self._count(self.client_hits, key, rule, now)
+        found = []
+        for table, key, (limit, window) in specs:
+            store = self.globals if table is None else table.buckets
+            bucket = store.get(key) or [now, 0, 0, window]
+            retry = _retry_after(bucket, limit, now)
+            if retry:
+                return retry
+            found.append((store, key, bucket))
+        for store, key, bucket in found:
+            store[key] = bucket
+            bucket[1] += 1
+        return None
 
-    def hit(self, key: str, rule: tuple[int, int]) -> int | None:
-        """A cap for one anonymous key (normally built from ip_bucket)."""
+    def take_client(self, key: str, rule: tuple[int, int]) -> int | None:
+        """Layer 2: a bucket for one authenticated OAuth client."""
         now = self.clock()
-        self._since_sweep += 1
-        if key not in self.hits:
-            full = len(self.hits) >= self.MAX_KEYS
-            if (self._since_sweep >= self.SWEEP_EVERY
-                    or (full and now - self._last_sweep >= self.SWEEP_INTERVAL)):
-                self._sweep(self.hits, now)
-                self._since_sweep, self._last_sweep = 0, now
-            if len(self.hits) >= self.MAX_KEYS:
-                return self._count(self.global_hits, "overflow", self.OVERFLOW_RULE, now)
-        return self._count(self.hits, key, rule, now)
+        if not self.clients.room_for(key, now, self.SWEEP_INTERVAL):
+            self.clients.sweep(now)  # bounded by the number of clients; full only if something is very wrong
+        return self.take([(self.clients, key, rule)])
+
+    def layer1(self, ip: str, endpoint: tuple[str, tuple[int, int]] | None, rules: "Limits",
+               may_skip_overflow: bool) -> tuple[int | None, bool]:
+        """(retry seconds or None, whether the network table was full and the overflow bucket was skipped)."""
+        now = self.clock()
+        net = ip_bucket(ip)
+        specs, skipped = [], False
+        addr_keys = [(f"a:{ip}", rules.per_addr)]
+        if endpoint is not None:
+            addr_keys.append((f"{endpoint[0]}:{ip}", endpoint[1]))
+        for key, rule in addr_keys:
+            if self.addr.room_for(key, now, self.SWEEP_INTERVAL):
+                specs.append((self.addr, key, rule))
+        if self.net.room_for(f"n:{net}", now, self.SWEEP_INTERVAL):
+            specs.append((self.net, f"n:{net}", rules.per_net))
+        elif may_skip_overflow:
+            skipped = True
+        else:
+            specs.append((None, "overflow", self.OVERFLOW_RULE))
+        return self.take(specs), skipped
 
 
 async def _send_json(send, status: int, body: dict, headers: list | None = None) -> None:
@@ -197,12 +234,6 @@ class Guard:
             if not started:
                 await _send_json(guarded_send, 500, {"error": "server_error"})
 
-    def _approved(self, client_id: str) -> bool:
-        if self.provider is None or not client_id:
-            return False
-        row = self.provider._client_row(client_id)
-        return row is not None and row[0] == "approved"
-
     async def _handle(self, scope, receive, send):
         path, method = scope.get("path", ""), scope.get("method", "")
         # uvicorn's proxy_headers puts the Funnel client address here (only 127.0.0.1 is trusted to set it)
@@ -210,7 +241,7 @@ class Guard:
         if ip in ("127.0.0.1", "::1") and not self._warned_no_forwarded_ip:
             self._warned_no_forwarded_ip = True
             log.warning("request without a forwarded client address (no X-Forwarded-For from the proxy); "
-                        "per-IP limits then apply to all clients together")
+                        "per-address limits then apply to all clients together")
         request_ip.set(ip)
         headers = dict(scope.get("headers") or [])
         try:
@@ -220,22 +251,18 @@ class Guard:
         if length > MAX_BODY:
             return await _send_json(send, 413, {"error": "too_large"})
 
-        lim, rules, net = self.limiter, self.limits, ip_bucket(ip)
-        is_token = path == "/token" and method == "POST"
-        # /mcp is limited after authentication (ClientRateLimit) and /token once the client is known (below), so
-        # strangers sharing or flooding the owner's network cannot use up the owner's quota
-        checks = [] if path == "/mcp" or is_token else [(f"ip:{net}", rules.per_ip)]
-        if path == "/register" and method == "POST":
-            checks.append((f"register:{net}", rules.register_ip))
-        elif path == "/authorize" or path.startswith("/oauth/"):
-            checks.append((f"login:{net}", rules.login_ip))
-        for key, rule in checks:
-            retry = lim.hit(key, rule)
-            if retry:
-                return await _too_many(send, retry)
-        # global caps only after every per-key check passed: one network at its own cap spends none of the quota
-        if path == "/register" and method == "POST":
-            retry = lim.hit_global("register", rules.register_global)
+        # layer 1: cheap, before any parsing or database work
+        lim, rules = self.limiter, self.limits
+        is_token, is_register = (path == "/token" and method == "POST"), (path == "/register" and method == "POST")
+        endpoint = (("register", rules.register_addr) if is_register
+                    else ("login", rules.login_addr) if path == "/authorize" or path.startswith("/oauth/")
+                    else ("token", rules.token_addr) if is_token else None)
+        retry, skipped_overflow = lim.layer1(ip, endpoint, rules, may_skip_overflow=is_token or path == "/mcp")
+        if retry:
+            return await _too_many(send, retry)
+        scope.setdefault("state", {})["pfm_overflow"] = skipped_overflow
+        if is_register:  # global cap, counted only once this address passed its own limits
+            retry = lim.take([(None, "register", rules.register_global)])
             if retry:
                 return await _too_many(send, retry)
 
@@ -250,42 +277,47 @@ class Guard:
                     raise _TooLarge()
             return message
 
-        if is_token:
-            body = b""
-            while True:
-                message = await counted_receive()
-                body += message.get("body", b"")
-                if not message.get("more_body"):
-                    break
-            form = urllib.parse.parse_qs(body.decode("latin-1"))
-            client_id = (form.get("client_id") or [_basic_client_id(headers.get(b"authorization", b""))])[0][:64]
-            if self._approved(client_id):
-                # an approved client has its own bucket and is never counted against the anonymous or global caps
-                retry = lim.hit_client(f"token:{client_id}", rules.token_client)
-            else:
-                # unknown, pending or junk client ids are anonymous traffic: per network, then the global cap
-                retry = (lim.hit(f"ip:{net}", rules.per_ip) or lim.hit(f"token-anon:{net}", rules.token_client)
-                         or lim.hit_global("token", rules.token_global))
-            if retry:
-                return await _too_many(send, retry)
-            resource = (form.get("resource") or [None])[0]
-            if resource is not None and canonical(resource) != canonical(self.resource):
-                return await _send_json(send, 400, {"error": "invalid_target",
-                                                    "error_description": "Unknown resource."})
-            code, verifier = (form.get("code") or [None])[0], (form.get("code_verifier") or [None])[0]
-            if self.provider is not None and code and verifier:
-                self.provider.burn_code_on_bad_verifier(code, verifier)
-            replayed = False
+        if not is_token:
+            return await self.app(scope, counted_receive, send)
 
-            async def replay():
-                nonlocal replayed
-                if not replayed:
-                    replayed = True
-                    return {"type": "http.request", "body": body, "more_body": False}
-                return await receive()
+        body = b""
+        while True:
+            message = await counted_receive()
+            body += message.get("body", b"")
+            if not message.get("more_body"):
+                break
+        form = urllib.parse.parse_qs(body.decode("latin-1"))
+        form_ids = form.get("client_id", [])
+        basic_id = _basic_client_id(headers.get(b"authorization", b""))
+        if len(form_ids) > 1 or (form_ids and basic_id and form_ids[0] != basic_id):
+            return await _send_json(send, 400, {"error": "invalid_request",
+                                                "error_description": "client_id given more than once."})
+        resource = (form.get("resource") or [None])[0]
+        if resource is not None and canonical(resource) != canonical(self.resource):
+            return await _send_json(send, 400, {"error": "invalid_target", "error_description": "Unknown resource."})
+        code, verifier = (form.get("code") or [None])[0], (form.get("code_verifier") or [None])[0]
+        if self.provider is not None and code and verifier:
+            self.provider.burn_code_on_bad_verifier(code, verifier)  # in memory only
+        replayed = False
 
-            return await self.app(scope, replay, send)
-        return await self.app(scope, counted_receive, send)
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        status = 0
+
+        async def watch(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        await self.app(scope, replay, watch)
+        if skipped_overflow and status >= 400:
+            lim.take([(None, "overflow", lim.OVERFLOW_RULE)])  # failed attempts from an overflowed network
 
 
 def _basic_client_id(header: bytes) -> str:
@@ -300,7 +332,7 @@ def _basic_client_id(header: bytes) -> str:
 
 
 class ClientRateLimit:
-    """Inside the SDK's auth middleware, so the authenticated OAuth client is known: per-client limit on /mcp."""
+    """Layer 2 for /mcp, inside the SDK's auth middleware so the authenticated OAuth client is known."""
 
     def __init__(self, app, limiter: RateLimiter, rule: tuple[int, int], anonymous_rule: tuple[int, int]):
         self.app, self.limiter, self.rule, self.anonymous_rule = app, limiter, rule, anonymous_rule
@@ -309,10 +341,12 @@ class ClientRateLimit:
         if scope["type"] == "http" and scope.get("path") == "/mcp":
             user = scope.get("user")
             if isinstance(user, AuthenticatedUser):
-                retry = self.limiter.hit_client(f"mcp:{user.access_token.client_id}", self.rule)
+                retry = self.limiter.take_client(f"mcp:{user.access_token.client_id}", self.rule)
+            elif (scope.get("state") or {}).get("pfm_overflow"):
+                retry = self.limiter.take([(None, "overflow", self.limiter.OVERFLOW_RULE)])
             else:
                 ip = (scope.get("client") or ("unknown",))[0]
-                retry = self.limiter.hit(f"mcp-anon:{ip_bucket(ip)}", self.anonymous_rule)
+                retry = self.limiter.take([(self.limiter.addr, f"mcp-anon:{ip}", self.anonymous_rule)])
             if retry:
                 return await _too_many(send, retry)
         await self.app(scope, receive, send)
@@ -384,9 +418,11 @@ def build_app(cfg: RemoteConfig, github, limits: Limits = Limits(), clock: Calla
                                   max_request_body_size=MAX_BODY)
     _advertise_public_clients(app, settings)
     limiter = limiter or RateLimiter()
-    # appended after the SDK's auth middleware, so it runs with the authenticated user known
+    # layer 2: appended after the SDK's auth middleware, so it runs with the authenticated user known
     app.user_middleware.append(Middleware(ClientRateLimit, limiter=limiter, rule=limits.mcp_client,
-                                          anonymous_rule=limits.mcp_unauthenticated_ip))
+                                          anonymous_rule=limits.mcp_anonymous_addr))
+    # layer 2 for /token: the provider calls this once the SDK has authenticated the client and validated the grant
+    provider.client_rate_limit = lambda client_id: limiter.take_client(f"token:{client_id}", limits.token_client)
     return Guard(app, limiter, limits, auth_cfg.resource, provider), provider
 
 
