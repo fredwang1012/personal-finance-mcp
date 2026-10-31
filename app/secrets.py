@@ -61,7 +61,7 @@ def set_plaid_keys(env: str, client_id: str, secret: str) -> None:
 
 
 def delete_plaid_keys(env: str) -> None:
-    _delete("plaid_client_id")
+    # client_id is shared across environments, so only this environment's secret is removed
     _delete(_secret_key(env))
 
 
@@ -87,7 +87,18 @@ def delete_access_token(env: str, item_id: str) -> None:
 
 def list_item_ids(env: str) -> list[str]:
     raw = keyring.get_password(SERVICE, f"{_ITEMS_KEY}_{env}")
-    return json.loads(raw) if raw else []
+    if not raw:
+        return []
+    try:
+        ids = json.loads(raw)
+    except json.JSONDecodeError:
+        ids = None
+    if not isinstance(ids, list):
+        raise MissingSecret(
+            f"The stored list of linked items for '{env}' is corrupt. Run: {LINK_CMD} to link again "
+            f"(this replaces the list)."
+        ) from None
+    return ids
 
 
 def _save_items(env: str, ids: list[str]) -> None:

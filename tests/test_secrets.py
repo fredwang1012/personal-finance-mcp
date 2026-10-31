@@ -60,3 +60,21 @@ def test_empty_input_stores_nothing(monkeypatch):
     monkeypatch.setattr(getpass, "getpass", lambda prompt="": "")
     assert cli.main(["set-plaid-keys"]) == 1
     assert not secrets.has_plaid_keys(cli.settings.plaid_env)
+
+
+def test_delete_plaid_keys_keeps_shared_client_id():
+    secrets.set_plaid_keys("sandbox", "cid", "sec-sb")
+    secrets.set_plaid_keys("production", "cid", "sec-prod")
+    secrets.delete_plaid_keys("sandbox")
+    assert secrets.get_client_id() == "cid"
+    assert secrets.has_plaid_keys("production")
+    assert not secrets.has_plaid_keys("sandbox")
+
+
+@pytest.mark.parametrize("raw", ["{not json", '{"a": 1}'])
+def test_corrupt_linked_items_gives_friendly_error(memory_keyring, raw):
+    memory_keyring.set_password(secrets.SERVICE, "linked_items_sandbox", raw)
+    with pytest.raises(secrets.MissingSecret) as exc:
+        secrets.list_item_ids("sandbox")
+    assert secrets.LINK_CMD in str(exc.value)
+    assert raw not in str(exc.value)
