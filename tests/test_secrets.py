@@ -78,3 +78,13 @@ def test_corrupt_linked_items_gives_friendly_error(memory_keyring, raw):
         secrets.list_item_ids("sandbox")
     assert secrets.LINK_CMD in str(exc.value)
     assert raw not in str(exc.value)
+
+
+def test_set_plaid_keys_reports_lengths_not_values(monkeypatch, capsys):
+    answers = iter(["0123456789abcdef01234567", '"0123456789abcdef0123456789abcd"'])
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(answers))
+    assert cli.main(["set-plaid-keys"]) == 0
+    out = capsys.readouterr().out
+    assert "...e392 (24 characters)" in out and "secret has 30 characters" in out
+    assert "0123456789abcdef" not in out
+    assert secrets.get_plaid_secret(cli.settings.plaid_env) == "0123456789abcdef0123456789abcd"

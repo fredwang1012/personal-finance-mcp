@@ -13,13 +13,17 @@ ALREADY_GONE = {"ITEM_NOT_FOUND", "INVALID_ACCESS_TOKEN"}
 
 def set_plaid_keys() -> int:
     # getpass keeps values out of argv, shell history and the terminal
-    client_id = getpass.getpass("Plaid client_id: ").strip()
-    secret = getpass.getpass(f"Plaid {settings.plaid_env} secret: ").strip()
+    print("Typing and pasting show nothing here. If Ctrl+V does nothing, paste with a right-click.")
+    client_id = getpass.getpass("Plaid client_id: ").strip().strip('"')
+    secret = getpass.getpass(f"Plaid {settings.plaid_env} secret: ").strip().strip('"')
     if not client_id or not secret:
         print("Both values are required; nothing stored.", file=sys.stderr)
         return 1
     secrets.set_plaid_keys(settings.plaid_env, client_id, secret)
     print(f"Stored Plaid keys for '{settings.plaid_env}' in the OS keychain.")
+    # enough to spot a failed paste without showing the secret: Plaid client ids are 24 characters, secrets 30
+    print(f"Check: client_id ends in ...{client_id[-4:]} ({len(client_id)} characters); "
+          f"secret has {len(secret)} characters.")
     return 0
 
 
