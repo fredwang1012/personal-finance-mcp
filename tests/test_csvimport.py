@@ -81,8 +81,13 @@ def test_malformed_rows_reported_without_contents(conn, tmp_path):
 def test_unrecognised_and_binary_files_error(conn, tmp_path):
     f = tmp_path / "x.csv"
     f.write_text("foo,bar\n1,2\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="headers found: foo, bar"):
         csvimport.import_file(f, conn)
+    h = tmp_path / "z.csv"
+    h.write_text("Acct 123456789012,Weird Header\n1,2\n")
+    with pytest.raises(ValueError, match="weird_header") as info:
+        csvimport.import_file(h, conn)
+    assert "123456789012" not in str(info.value)
     g = tmp_path / "y.csv"
     g.write_bytes(b"\xff\xfe\x00\x01")
     with pytest.raises(ValueError):

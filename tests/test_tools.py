@@ -403,3 +403,41 @@ def test_label_with_long_digit_run_is_an_identifier():
     from app import csvimport
     assert csvimport._looks_like_number("ABC12345678")
     assert not csvimport._looks_like_number("RRSP-2024-01")
+
+
+def test_notes_are_deduplicated_in_order(tmp_path):
+    conn = store.connect(tmp_path / "d.db")
+    _csv_account(conn, "A", "TFSA", "1234", symbol="X", currency="cad")
+    _csv_account(conn, "B", "RRSP", "5678", symbol="Y", currency="c$d")
+    b = tools.Backend(conn, None, {}, ["first", "second", "first"], today=lambda: TODAY)
+    for out in (tools.list_accounts(b), tools.get_holdings(b), tools.allocation(b)):
+        assert out["notes"][:2] == ["first", "second"]
+        assert len(out["notes"]) == len(set(out["notes"]))
+        assert sum("invalid currency" in n for n in out["notes"]) == 1
+
+
+def test_empty_csv_account_has_no_double_count_note(tmp_path):
+    conn = store.connect(tmp_path / "e.db")
+    conn.execute("INSERT INTO accounts VALUES ('emptyacct', 'Old Cash', 'CASH', '9999', 'csv', 'now', NULL)")
+    conn.commit()
+    plaid = PlaidWith([_account("p1", "TFSA", "tfsa", "4444", "CAD", 10)])
+    out = tools.list_accounts(tools.Backend(conn, plaid, {ITEM_OK: TOKEN_OK}, today=lambda: TODAY))
+    assert "Old Cash" in {a["name"] for a in out["accounts"]}
+    assert not [n for n in out["notes"] if "double count" in n]
+
+
+def test_invalid_currency_codes_become_placeholder(tmp_path):
+    conn = store.connect(tmp_path / "c.db")
+    _csv_account(conn, "Weird", "TFSA", "1234", symbol="W", value="5", currency="<b>X")
+    conn.execute("INSERT INTO transactions VALUES ('h1', ?, '2024-03-01', 'fee', '', '', '', '', '-1', 'usd ',"
+                 " 'fee', 'csv', 'now', NULL)", (conn.execute("SELECT account_id FROM accounts").fetchone()[0],))
+    conn.commit()
+    bad = _account("p1", "Plaid", "tfsa", "4444", "EVIL<script>", 10)
+    b = tools.Backend(conn, PlaidWith([bad]), {ITEM_OK: TOKEN_OK}, today=lambda: TODAY)
+    outs = [tools.list_accounts(b), tools.get_holdings(b), tools.get_transactions(b, 30), tools.net_worth(b)]
+    blob = json.dumps(outs)
+    assert "<b>X" not in blob and "EVIL" not in blob and "usd " not in blob
+    assert {a["currency"] for a in outs[0]["accounts"]} == {"???"}
+    assert outs[1]["holdings"][0]["currency"] == "???"
+    assert outs[2]["transactions"][0]["currency"] == "???"
+    assert all(any("invalid currency" in n for n in o["notes"]) for o in outs)

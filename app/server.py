@@ -1,7 +1,10 @@
 """Read-only MCP server over stdio: python -m app.server.
 
 Startup touches neither the network nor the keychain; credentials are read lazily on the first tool call.
+PFMCP_FAKE_PLAID=1 is a test-only switch with a guard; see app/testmode.py.
 """
+import os
+import sys
 from typing import Callable
 
 from mcp.server.mcpserver import MCPServer
@@ -22,6 +25,16 @@ TX_CONVENTIONS = (
     " Transaction amounts: negative = cash out of the account, positive = cash in. 'days' is capped at "
     f"{tools.MAX_DAYS} and 'limit' at {tools.MAX_LIMIT}; beyond the limit the most recent rows are returned with a summary."
 )
+
+
+
+def _real_plaid(s):
+    from app.plaid_client import RealPlaid
+
+    return RealPlaid.from_settings(s)
+
+
+plaid_factory: Callable = _real_plaid  # replaced only by the guarded test mode in main()
 
 mcp = MCPServer("personal-finance-mcp", instructions="Read-only view of the owner's Wealthsimple accounts. " + CONVENTIONS)
 
@@ -51,9 +64,7 @@ def open_backend() -> tools.Backend:
                     # the exception text names the keychain entry, which contains the raw item id
                     notes.append(f"Plaid item {tools._short(item_id)} has no stored access token. Run: {secrets.LINK_CMD}")
             if tokens:
-                from app.plaid_client import RealPlaid
-
-                api = RealPlaid.from_settings(settings)
+                api = plaid_factory(settings)
     except secrets.MissingSecret:
         notes.append(f"Plaid keys are missing. Run: {secrets.SET_KEYS_CMD}")
     except Exception as exc:
@@ -124,6 +135,15 @@ def item_health() -> dict:
 
 
 def main() -> None:
+    global plaid_factory
+    if os.environ.get("PFMCP_FAKE_PLAID"):
+        from app import testmode
+
+        if testmode.allowed(settings.data_dir):
+            testmode.install(settings.plaid_env)
+            plaid_factory = testmode.FakePlaid
+        else:  # stdout carries the protocol, so the warning goes to stderr
+            print("PFMCP_FAKE_PLAID ignored: DATA_DIR is not a pytest temp directory.", file=sys.stderr)
     mcp.run("stdio")
 
 

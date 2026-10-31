@@ -269,7 +269,9 @@ def import_file(path: Path, conn, now: datetime | None = None) -> ImportResult:
             raise ValueError("duplicate column names after normalisation")
         kind = detect_kind(set(headers))
         if kind is None:
-            raise ValueError("unrecognised Wealthsimple export format (see app/csvimport.py docstring)")
+            # header names help fix the alias table; they are masked like any text in case row 1 is data
+            found = _text(", ".join(h for h in headers if h))[:200] or "none"
+            raise ValueError(f"unrecognised Wealthsimple export format; headers found: {found} (see README)")
         result = ImportResult(kind=kind)
         held: dict[tuple, tuple] = {}  # holdings seen in this file, so split lots can be combined
         seen: dict[str, int] = {}  # identical rows inside one file are real repeats (e.g. two equal fills)

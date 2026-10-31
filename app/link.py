@@ -13,6 +13,7 @@ from pathlib import Path
 
 from app import secrets
 from app.plaid_client import PlaidAPI, PlaidError
+from app.tools import _short
 
 PAGE = Path(__file__).parent / "static" / "link.html"
 TIMEOUT_SECONDS = 600
@@ -86,16 +87,17 @@ class LinkServer(ThreadingHTTPServer):
             if self._exchanged:
                 raise PermissionError("already exchanged")
             access_token, item_id = self.plaid.exchange_public_token(public_token)
+            short = _short(item_id)
             try:
                 secrets.set_access_token(self.env, item_id, access_token)
             except Exception:
                 # Without a stored token the Item is orphaned (and burns a Trial slot), so release it
-                print(f"WARNING: could not store the token for item {item_id} in the keychain.")
+                print(f"WARNING: could not store the token for item {short} in the keychain.")
                 try:
                     self.plaid.item_remove(access_token)
                 except Exception:
-                    print(f"WARNING: could not remove item {item_id} from Plaid either; remove it in the Plaid dashboard.")
-                raise StoreError(item_id) from None
+                    print(f"WARNING: could not remove item {short} from Plaid either; remove it in the Plaid dashboard.")
+                raise StoreError(short) from None
             self._exchanged = True
             self.item_id = item_id
         return item_id
@@ -164,7 +166,7 @@ class _Handler(BaseHTTPRequestHandler):
         except PlaidError as exc:
             print(f"Plaid rejected the link: {exc.code}")
             return self._send(502, b"exchange failed")
-        print(f"Linked item {item_id}. Token stored in the OS keychain.")
+        print(f"Linked item {_short(item_id)}. Token stored in the OS keychain.")
         self.server.stop_soon()  # before replying, so a broken pipe cannot keep the helper alive
         self._send(200, b'{"ok": true}', "application/json")
 
