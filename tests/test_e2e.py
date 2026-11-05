@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -118,7 +119,8 @@ def test_stdio_server_end_to_end(client, tmp_path):
         "id": payload["accounts"][0]["id"], "name": "TFSA", "account_kind": "tfsa", "kind_basis": "subtype",
         "tax": "tax-free", "last4": "0001", "currency": "CAD", "balance": "1234.56", "cash_estimate": "109.56",
     }], "fx": {"pair": "USDCAD", "rate": "1.25", "date": "2024-01-02", "source": "Bank of Canada"},
-        "notes": [tools.US_LISTED_NOTE, tools.CASH_NOTE]}
+        "data_as_of": payload["data_as_of"], "notes": [tools.US_LISTED_NOTE, tools.CASH_NOTE]}
+    assert payload["data_as_of"] < datetime.now(timezone.utc).isoformat()  # an hour old in the fake: no stale note
     # 1234.56 - 1000 CAD - 100 USD x 1.25: the fake rate was used, so the Bank of Canada was never called; and there is
     # no keychain failure note, so the in-memory keyring was used
     for name, args in [("holdings", {"detail": "full"}), ("transactions", {"detail": "full"}), ("summary", {}),
@@ -152,6 +154,9 @@ def test_stdio_hostile_plaid_text_never_reaches_output(tmp_path):
         assert '"security_type":"other"' in blob and "[link]" in blob and "[email]" in blob
         # the derived fields ran on hostile data too
         assert '"account_kind":"tfsa"' in blob and '"cash_estimate"' in blob and '"by_kind"' in blob
+        # the failing item and the hostile institution status were read, with status values allow-listed
+        assert blob.count("refreshes from the institution failed") == 7 and '"refresh":"failing"' in blob
+        assert '"logins":"unknown"' in blob and "reports the institution DOWN" not in blob
         for marker in HOSTILE_MARKERS:
             assert marker not in blob, marker
     finally:

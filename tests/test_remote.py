@@ -55,7 +55,7 @@ class RecordingPlaid(FakePlaid):
     calls: list[str] = []
 
     def __getattribute__(self, name):
-        if not name.startswith("_") and name not in ("tx_count", "calls"):
+        if not name.startswith("_") and name not in ("tx_count", "calls", "success", "failed", "institution"):
             RecordingPlaid.calls.append(name)
         return super().__getattribute__(name)
 
@@ -378,7 +378,8 @@ def test_every_tool_over_http_calls_only_read_endpoints(remote):
     for i, name in enumerate(sorted(TOOLS)):
         r = rpc(client, tokens["access_token"], "tools/call", {"name": name, "arguments": {}}, rid=i + 2)
         assert r.status_code == 200 and "error" not in tool_payload(r), name
-    read_only = {"accounts_get", "investments_holdings_get", "investments_transactions_get", "item_get"}
+    read_only = {"accounts_get", "investments_holdings_get", "investments_transactions_get", "item_get",
+                 "institution_status"}
     assert RecordingPlaid.calls and set(RecordingPlaid.calls) <= read_only
 
 
