@@ -23,6 +23,13 @@ What the raw Plaid data means, and how it is presented (see account_kind and _de
 
 Plaid responses are cached per process (PlaidCache) as raw responses keyed by item, token digest, endpoint and
 arguments; every call still runs the full clean-and-merge pipeline on them, so caching changes no output.
+
+Freshness: Plaid refreshes an Item in the background, and those refreshes can fail for days while item.error stays
+null. So every data tool also reads the Item's status (/item/get, cached for FRESHNESS_TTL) and reports data_as_of,
+the oldest last successful update across the items it used, with one note when any item is over STALE_HOURS old or
+its last refresh failed. Plaid's institution status (/institutions/get_by_id) is fetched for that note only when an
+item is stale or failing, and by health; it is cached per institution for FRESHNESS_TTL. Status values are
+allow-listed (PLAID_STATUSES, else "unknown") and timestamps are re-formatted, so no raw Plaid text is echoed.
 """
 import copy
 import hashlib
@@ -34,7 +41,7 @@ import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable
 
@@ -52,6 +59,11 @@ FULL_TEXT = 120
 CACHE_TTL = 300  # seconds
 MAX_WORKERS = 8
 UNCACHED = {"item_get"}  # health should reflect the connection right now
+FRESHNESS_TTL = 900  # seconds: item status for data tools, and institution status, at most once per 15 min
+STALE_HOURS = 24
+PLAID_STATUSES = {"HEALTHY", "DEGRADED", "DOWN"}
+INSTITUTION_ID_RE = re.compile(r"ins_[A-Za-z0-9]{1,32}")
+FRESHNESS_PRODUCTS = ("investments", "transactions")  # investments first: it is the product this server reads
 MAX_SYMBOL = 12
 MAX_KIND = 24
 # Plaid's documented enums; anything else (a hostile or new value) is shown as "other" rather than echoed
@@ -161,8 +173,63 @@ def _reauth_hint(short: str) -> str:
             "and use another Trial slot.")
 
 
-def _iso(value: Any) -> str:
-    return value.isoformat() if isinstance(value, datetime) else str(value or "")
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _when(raw: Any) -> datetime | None:
+    """A Plaid timestamp (datetime, or an ISO string) as an aware datetime; anything else is None."""
+    if isinstance(raw, datetime):
+        when = raw
+    elif isinstance(raw, str) and TIMESTAMP_RE.fullmatch(raw.strip()):
+        try:
+            when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _utc_iso(when: datetime | None) -> str | None:
+    """Our own formatting of a parsed timestamp, never Plaid's text."""
+    return when.astimezone(timezone.utc).isoformat(timespec="seconds") if when else None
+
+
+def _dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _item_freshness(resp: dict, now: datetime) -> dict:
+    """Last successful and (when newer) last failed update of an Item, from /item/get's top-level status."""
+    status = _dict(resp.get("status"))
+    products = [_dict(status.get(p)) for p in FRESHNESS_PRODUCTS]
+    success = failed = None
+    for product in products:  # the first product with a success; its failure is the one that matters
+        if success := _when(product.get("last_successful_update")):
+            failed = _when(product.get("last_failed_update"))
+            break
+    else:
+        failed = next((f for p in products if (f := _when(p.get("last_failed_update")))), None)
+    failing = failed is not None and (success is None or failed > success)
+    institution = str(_dict(resp.get("item")).get("institution_id") or "")
+    return {"success": success, "failed": failed if failing else None, "failing": failing,
+            "age": max((now - success).total_seconds() / 3600, 0.0) if success else None,
+            "institution_id": institution if INSTITUTION_ID_RE.fullmatch(institution) else None}
+
+
+def _plaid_status(raw: Any) -> str:
+    value = _enum(raw)
+    return value if value in PLAID_STATUSES else "unknown"
+
+
+def _institution_status(resp: Any) -> dict:
+    """Only the allow-listed status of logins and investments updates, and when it last changed."""
+    status = _dict(_dict(_dict(resp).get("institution")).get("status"))
+    logins, updates = _dict(status.get("item_logins")), _dict(status.get("investments_updates"))
+    since = _when(updates.get("last_status_change")) or _when(logins.get("last_status_change"))
+    return {"logins": _plaid_status(logins.get("status")), "investments_updates": _plaid_status(updates.get("status")),
+            "since": _utc_iso(since)}
 
 
 def _error_note(short: str, exc: Exception, clean: Callable[[str], str] = clean_text) -> str:
@@ -214,23 +281,24 @@ class PlaidCache:
 
     def __init__(self, ttl: float = CACHE_TTL, clock: Callable[[], float] = time.monotonic):
         self.ttl, self.clock = ttl, clock
-        self._data: dict[tuple, tuple[float, Any]] = {}
+        self._data: dict[tuple, tuple[float, Any, float]] = {}  # key -> (stored at, value, ttl)
         self._lock = threading.Lock()
 
     @staticmethod
     def key(item_id: str, token: str, endpoint: str, args: tuple) -> tuple:
         return (item_id, hashlib.sha256(token.encode()).hexdigest(), endpoint, *args)
 
-    def get(self, key: tuple, fetch: Callable[[], Any]) -> Any:
+    def get(self, key: tuple, fetch: Callable[[], Any], ttl: float | None = None) -> Any:
+        """The cached value, or fetch() stored for `ttl` seconds (the cache's own TTL by default)."""
         with self._lock:
             hit = self._data.get(key)
-            if hit and self.clock() - hit[0] < self.ttl:
+            if hit and self.clock() - hit[0] < hit[2]:
                 return copy.deepcopy(hit[1])
         value = fetch()  # an exception propagates and nothing is stored
         with self._lock:
             now = self.clock()
-            self._data = {k: v for k, v in self._data.items() if now - v[0] < self.ttl}
-            self._data[key] = (now, value)
+            self._data = {k: v for k, v in self._data.items() if now - v[0] < v[2]}
+            self._data[key] = (now, value, self.ttl if ttl is None else ttl)
         return copy.deepcopy(value)
 
     def clear(self) -> None:
@@ -250,7 +318,9 @@ class Backend:
     cache: PlaidCache | None = None  # shared across calls by the server; None fetches every time
     secrets: tuple[str, ...] = ()  # Plaid client id and secret, redacted from free text as defence in depth
     fx: Callable[[], Any] | None = None  # returns an app.fx.Rate or None (no rate); None here means FX lookup is off
+    now: Callable[[], datetime] = _utcnow  # aware datetime, for the age of Plaid data
     _pids: set[str] = field(default_factory=set)  # Plaid account ids seen so far; scrubbed from free text
+    _fresh: list[dict] = field(default_factory=list)  # _item_freshness of each item the last _load_plaid used
 
     def clean(self, raw: Any) -> str:
         """Sanitise free text from Plaid and remove anything that looks like a token or a known id."""
@@ -275,11 +345,25 @@ class Backend:
     # ---- gathering -------------------------------------------------------------------------------------------
 
     def _call(self, item_id: str, endpoint: str, args: tuple = ()) -> Any:
+        """endpoint "item_status" is /item/get for the data tools: minimised and cached for FRESHNESS_TTL. Plain
+        "item_get" (health) is never cached."""
         token = self.tokens[item_id]
-        fetch = lambda: _minimise(endpoint, getattr(self.api, endpoint)(token, *args))  # noqa: E731
+        method = "item_get" if endpoint == "item_status" else endpoint
+        fetch = lambda: _minimise(endpoint, getattr(self.api, method)(token, *args))  # noqa: E731
         if self.cache is None or endpoint in UNCACHED:
             return fetch()
-        return self.cache.get(PlaidCache.key(item_id, token, endpoint, args), fetch)
+        ttl = FRESHNESS_TTL if endpoint == "item_status" else None
+        return self.cache.get(PlaidCache.key(item_id, token, endpoint, args), fetch, ttl=ttl)
+
+    def institution_status(self, institution_id: str | None) -> dict | None:
+        """Plaid's allow-listed status of an institution, cached per institution for FRESHNESS_TTL. None when there
+        is no valid institution id; a failed call raises and is not cached."""
+        if not self.api or not institution_id or not INSTITUTION_ID_RE.fullmatch(institution_id):
+            return None
+        fetch = lambda: _institution_status(self.api.institution_status(institution_id))  # noqa: E731
+        if self.cache is None:
+            return fetch()
+        return self.cache.get(("institution_status", institution_id), fetch, ttl=FRESHNESS_TTL)
 
     def _fetch_all(self, jobs: list[tuple[str, str, tuple]]) -> dict[tuple[str, str], Any]:
         """Run (item_id, endpoint, args) Plaid calls concurrently. Each result is the response or the exception."""
@@ -310,16 +394,17 @@ class Backend:
         accounts: list[dict] = []
         held: list[dict] = []
         txs: list[dict] = []
+        self._fresh = []
         if not self.api:
             return accounts, held, txs
-        endpoints = [("accounts_get", ())]
+        endpoints = [("accounts_get", ()), ("item_status", ())]
         if holdings:
             endpoints.append(("investments_holdings_get", ()))
         if tx_range:
             endpoints.append(("investments_transactions_get", tuple(tx_range)))
         results = self._fetch_all([(item, ep, args) for item in self.tokens for ep, args in endpoints])
         self._learn_ids(results)
-        optional = {"investments_holdings_get"} if holdings == "optional" else set()
+        optional = {"item_status"} | ({"investments_holdings_get"} if holdings == "optional" else set())
         for item_id in self.tokens:
             short = short_hash(item_id)
             try:
@@ -348,6 +433,8 @@ class Backend:
                 notes.append(_error_note(short, exc, self.clean))
                 continue
             notes += item_notes
+            if isinstance(status := results[item_id, "item_status"], dict):  # no status, no freshness claim
+                self._fresh.append(_item_freshness(status, self.now()))
             accounts += item_accounts
             held += item_held
             txs += item_txs
@@ -540,6 +627,11 @@ def _row_currency(row: dict, sec: dict, acct: dict, notes: list[str]) -> str | N
 
 
 def _minimise(endpoint: str, resp: Any) -> Any:
+    if endpoint == "item_status" and isinstance(resp, dict):  # only what _item_freshness reads
+        status = _dict(resp.get("status"))
+        return {"item": {"institution_id": _dict(resp.get("item")).get("institution_id")},
+                "status": {p: {k: _dict(status.get(p)).get(k) for k in ("last_successful_update", "last_failed_update")}
+                           for p in FRESHNESS_PRODUCTS}}
     keep = KEEP.get(endpoint)
     if keep is None or not isinstance(resp, dict):
         return resp
@@ -782,6 +874,34 @@ def _start(backend: Backend) -> list[str]:
     return list(backend.setup_notes)
 
 
+def _worst_status(statuses: list[dict]) -> str | None:
+    seen = {s.get(k) for s in statuses for k in ("logins", "investments_updates")}
+    return next((s for s in ("DOWN", "DEGRADED") if s in seen), None)
+
+
+def _data_as_of(backend: Backend, notes: list[str]) -> str | None:
+    """data_as_of for a response that used Plaid data, plus one note when any item is stale or failing."""
+    known = [f for f in backend._fresh if f["success"]]
+    oldest = min(known, key=lambda f: f["success"]) if known else None
+    bad = [f for f in backend._fresh if f["failing"] or (f["age"] is not None and f["age"] > STALE_HOURS)]
+    if bad:
+        statuses = []
+        for institution in dict.fromkeys(f["institution_id"] for f in bad):
+            try:
+                if status := backend.institution_status(institution):
+                    statuses.append(status)
+            except Exception:  # the note stands without it
+                pass
+        reason = ("Plaid's latest refreshes from the institution failed" if any(f["failing"] for f in bad)
+                  else f"Plaid hasn't refreshed it in over {STALE_HOURS} h")
+        if worst := _worst_status(statuses):
+            reason += f" and Plaid reports the institution {worst}"
+        lead = (f"Data is as of {oldest['success'].astimezone(timezone.utc).date().isoformat()} "
+                f"({oldest['age']:.0f} h old)" if oldest else "Plaid reports no successful refresh")
+        notes.append(f"{lead}: {reason}. Figures may be out of date; this is not a live view.")
+    return _utc_iso(oldest["success"]) if oldest else None
+
+
 def _full(detail: str) -> bool:
     return str(detail).strip().lower() == "full"
 
@@ -824,7 +944,8 @@ def accounts(backend: Backend, detail: str = "concise") -> dict:
         out.append(row)
     if hidden:
         notes.append(HIDDEN_NOTE)
-    return _result(notes, accounts=out, hidden_empty=hidden or None, fx=fx)
+    as_of = _data_as_of(backend, notes)
+    return _result(notes, accounts=out, hidden_empty=hidden or None, fx=fx, data_as_of=as_of)
 
 
 def holdings(backend: Backend, account: str | None = None, detail: str = "concise",
@@ -856,7 +977,8 @@ def holdings(backend: Backend, account: str | None = None, detail: str = "concis
     summary = {"count": len(rows), "value": {c: _money(v) for c, v in sorted(totals.items())}}
     if len(rows) > limit:
         summary["omitted"] = len(rows) - limit
-    return _result(notes, holdings=out, summary=summary)
+    as_of = _data_as_of(backend, notes)
+    return _result(notes, holdings=out, summary=summary, data_as_of=as_of)
 
 
 def transactions(backend: Backend, days: int = 90, account: str | None = None, symbol: str | None = None,
@@ -895,7 +1017,8 @@ def transactions(backend: Backend, days: int = 90, account: str | None = None, s
                "totals": {c: {k: _money(v) for k, v in f.items() if v} for c, f in sorted(flows.items())}}
     if len(rows) > limit:
         summary["omitted"] = len(rows) - limit
-    return _result(notes, transactions=out, summary=summary)
+    as_of = _data_as_of(backend, notes)
+    return _result(notes, transactions=out, summary=summary, data_as_of=as_of)
 
 
 def summary(backend: Backend, currency: str = "CAD") -> dict:
@@ -944,8 +1067,9 @@ def summary(backend: Backend, currency: str = "CAD") -> dict:
         notes.append("Several currencies: each is totalled separately, percentages are within each currency, "
                      "nothing is converted.")
     derived = _kind_totals(rows, primary, notes)
+    as_of = _data_as_of(backend, notes)
     return _result(notes, currency=primary, net_worth=by_currency.get(primary, {}).get("net_worth") or "0.00",
-                   basis="account_balances", **derived, fx=fx, by_currency=by_currency)
+                   basis="account_balances", **derived, fx=fx, by_currency=by_currency, data_as_of=as_of)
 
 
 def _table(values: dict[str, Decimal], shares: dict[str, Decimal]) -> dict:
@@ -1007,20 +1131,27 @@ def health(backend: Backend) -> dict:
         resp = results[item_id, "item_get"]
         if isinstance(resp, Exception):
             notes.append(_error_note(short, resp, backend.clean))
-            items.append({"id": short,
-                          "error": backend.clean(resp.code) if isinstance(resp, PlaidError) else type(resp).__name__})
+            items.append({"id": short, "error_code": backend.clean(resp.code) if isinstance(resp, PlaidError)
+                          else type(resp).__name__})
             continue
         item = resp.get("item") or {}
-        status = resp.get("status") or {}  # top level of /item/get, beside "item"
-        stamps = (_iso((status.get(k) or {}).get("last_successful_update")) for k in ("investments", "transactions"))
-        updates = [t for t in stamps if TIMESTAMP_RE.fullmatch(t)]
+        fresh = _item_freshness(resp, backend.now())  # status is top level of /item/get, beside "item"
         error = item.get("error") or {}
         code = backend.clean(_enum(error.get("error_code"))) or None
         if code == "ITEM_LOGIN_REQUIRED":
             notes.append(f"Plaid item {short} needs re-authentication. " + _reauth_hint(short))
+        try:
+            plaid_status = backend.institution_status(fresh["institution_id"])
+        except Exception:  # the failure's text is never echoed
+            plaid_status = None
+            notes.append(f"Plaid's institution status for item {short} couldn't be fetched; plaid_status is omitted.")
         items.append({
             "id": short, "institution": _text(backend.clean(item.get("institution_name") or ""), False),
             "products": sorted(backend.clean(_enum(p)) for p in item.get("products") or []),
-            "last_update": max(updates) if updates else None, "error": code,
+            "data_as_of": _utc_iso(fresh["success"]),
+            "age_hours": round(fresh["age"], 1) if fresh["age"] is not None else None,
+            "last_failed_update": _utc_iso(fresh["failed"]),
+            "refresh": "failing" if fresh["failing"] else "ok" if fresh["success"] else "unknown",
+            "plaid_status": plaid_status, "error_code": code,
         })
     return _result(notes, items=items)

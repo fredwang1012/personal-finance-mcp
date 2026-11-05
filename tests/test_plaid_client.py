@@ -130,3 +130,21 @@ def test_translate_uses_error_message_when_display_message_is_null():
     err = plaid_client._translate(exc)
     assert err.code == "INVALID_FIELD"
     assert "client_name" in str(err) and "access-sandbox" not in str(err)
+
+
+def test_institution_status_request_shape():
+    real = make_real()
+    captured = {}
+
+    def fake_get(request, **kwargs):
+        captured["req"], captured["kw"] = request, kwargs
+        return SimpleNamespace(to_dict=lambda: {"institution": {"status": {"item_logins": {"status": "HEALTHY"}}}})
+
+    real._api = SimpleNamespace(institutions_get_by_id=fake_get)
+    out = real.institution_status("ins_1")
+    assert out["institution"]["status"]["item_logins"]["status"] == "HEALTHY"
+    sent = captured["req"].to_dict()
+    assert sent["institution_id"] == "ins_1" and sent["options"] == {"include_status": True}
+    assert [str(c.value) for c in captured["req"].country_codes] == ["CA"]
+    assert captured["kw"] == {"_request_timeout": 30}
+    assert "institution_status" in plaid_client.PlaidAPI.__dict__

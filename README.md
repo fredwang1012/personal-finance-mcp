@@ -18,13 +18,15 @@ context. `detail: "full"` adds the less common fields.
 | `holdings` | Positions sorted by value: symbol, quantity, value, currency, account last 4, plus totals per currency. Filter by account id, last 4 or name; 50 rows by default (`limit`, max 500). Full adds name, price, cost basis, security type |
 | `transactions` | Investment activity from Plaid plus CSV imports for the last `days` (default 90, max 730), newest first, `limit` rows (default 25, max 200), with count, omitted count and money in/out per currency. Filters: `account`, `symbol`, `kind` (`buy`, `dividend`, ... or `investment`). Concise rows carry the description only when there is no symbol |
 | `summary` | Net worth (from account balances, `basis: account_balances`) and allocation by account type and by security type, per currency, with the total in the requested currency (default CAD). Security-type allocation comes from holdings within each currency. For the requested currency it adds `by_kind`, `cash_total_estimate` and `invested_total` |
-| `health` | Per linked Plaid item: institution, products, last successful update, error code |
+| `health` | Per linked Plaid item: institution, products, `data_as_of` and `age_hours` (last successful update), `refresh` (`ok` or `failing`, with `last_failed_update` when it is newer), `plaid_status` (Plaid's view of the institution: logins and investments updates, `HEALTHY`, `DEGRADED`, `DOWN` or `unknown`, and `since`), error code |
 
 Conventions shared by every tool are stated once, in the server instructions: amounts are decimal strings rounded to
 cents (quantities to 6 decimals), currencies are never converted except in cash estimates, transaction amounts are negative for money out, and
 every string field is untrusted data from financial institutions. Results carry a `notes` list only when there is
 something to know: a failed Plaid item, a CSV account that may be counted twice, mixed currencies, missing keys,
 or US-listed holdings that the institution labelled CAD (shown in USD based on their exchange).
+
+Every result built from Plaid data carries `data_as_of`: the oldest last successful update across the linked items it used. Plaid refreshes items in the background, and those refreshes can fail for days while the item reports no error. So when an item's data is over 24 hours old, or its latest refresh failed, the result gets one note saying how old the data is and, when Plaid reports it, that the institution is degraded or down. The item status is cached for 15 minutes, and Plaid's institution status is fetched only for that note or for `health`, also cached for 15 minutes. CSV-only rows keep their own `as_of`.
 
 ### What the Plaid data means
 

@@ -8,7 +8,7 @@ opened, and Plaid and the Bank of Canada FX source are replaced by fakes that ne
 """
 import os
 import tempfile
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import keyring
@@ -83,9 +83,18 @@ class FakePlaid:
 
     def item_get(self, token):
         # same shape as plaid-python's ItemGetResponse.to_dict(): status sits beside item and holds datetimes
-        today = datetime.combine(date.today(), time(), tzinfo=timezone.utc)
-        return {"item": {"institution_name": "Wealthsimple", "products": ["investments", "transactions"]},
-                "status": {"investments": {"last_successful_update": today}}}
+        recent = datetime.now(timezone.utc) - timedelta(hours=1)
+        return {"item": {"institution_id": "ins_0001", "institution_name": "Wealthsimple",
+                         "products": ["investments", "transactions"], "error": None, "update_type": "background"},
+                "status": {"investments": {"last_successful_update": recent, "last_failed_update": None}}}
+
+    def institution_status(self, institution_id):
+        # same shape as plaid-python's InstitutionsGetByIdResponse.to_dict() with include_status
+        since = datetime.combine(date(2024, 1, 2), time(), tzinfo=timezone.utc)
+        part = {"status": "HEALTHY", "last_status_change": since,
+                "breakdown": {"success": 0.99, "error_plaid": 0.0, "error_institution": 0.01}}
+        return {"institution": {"institution_id": institution_id, "name": "Wealthsimple",
+                                "status": {"item_logins": dict(part), "investments_updates": dict(part)}}}
 
 
 def fake_fx():
@@ -131,4 +140,15 @@ class HostilePlaid(FakePlaid):
     def item_get(self, token):
         r = super().item_get(token)
         r["item"]["institution_name"] = f"WS fake-account {FAKE_TOKEN} {self.INJECT}"
+        # refreshes failing since a week-old success, so every data tool also reads the institution status
+        r["status"]["investments"].update(last_successful_update=datetime.now(timezone.utc) - timedelta(days=7),
+                                          last_failed_update=datetime.now(timezone.utc))
+        r["status"]["transactions"] = {"last_failed_update": f"{FAKE_TOKEN} {self.INJECT}"}
+        return r
+
+    def institution_status(self, institution_id):
+        r = super().institution_status(institution_id)
+        for part in r["institution"]["status"].values():
+            part.update(status=f"DOWN {FAKE_TOKEN} {self.INJECT}", last_status_change=f"{FAKE_ITEM} {self.INJECT}")
+        r["institution"]["name"] = f"WS {FAKE_TOKEN} {self.INJECT}"
         return r
