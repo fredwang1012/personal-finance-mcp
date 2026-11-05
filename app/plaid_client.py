@@ -9,6 +9,8 @@ import plaid
 from plaid.api import plaid_api
 from plaid.model.accounts_get_request import AccountsGetRequest
 from plaid.model.country_code import CountryCode
+from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
+from plaid.model.institutions_get_by_id_request_options import InstitutionsGetByIdRequestOptions
 from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetRequest
 from plaid.model.investments_transactions_get_request import InvestmentsTransactionsGetRequest
 from plaid.model.investments_transactions_get_request_options import InvestmentsTransactionsGetRequestOptions
@@ -48,6 +50,7 @@ class PlaidAPI(Protocol):
     def investments_holdings_get(self, access_token: str) -> dict[str, Any]: ...
     def investments_transactions_get(self, access_token: str, start: date, end: date) -> dict[str, Any]: ...
     def item_get(self, access_token: str) -> dict[str, Any]: ...
+    def institution_status(self, institution_id: str) -> dict[str, Any]: ...  # read-only, needs no access token
     def item_remove(self, access_token: str) -> None: ...
 
 
@@ -147,6 +150,15 @@ class RealPlaid:
 
     def item_get(self, access_token: str) -> dict[str, Any]:
         return self._call(self._api.item_get, ItemGetRequest(access_token=access_token)).to_dict()
+
+    def institution_status(self, institution_id: str) -> dict[str, Any]:
+        """Plaid's view of the institution's health (logins, investments updates). Read-only; no Item is involved."""
+        request = InstitutionsGetByIdRequest(
+            institution_id=institution_id,
+            country_codes=[CountryCode(c) for c in self._country_codes],
+            options=InstitutionsGetByIdRequestOptions(include_status=True),
+        )
+        return self._call(self._api.institutions_get_by_id, request).to_dict()
 
     def item_remove(self, access_token: str) -> None:
         self._call(self._api.item_remove, ItemRemoveRequest(access_token=access_token))
