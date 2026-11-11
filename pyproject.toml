@@ -2,7 +2,7 @@
 name = "personal-finance-mcp"
 version = "0.1.0"
 description = "Local read-only MCP server for Wealthsimple data via Plaid, with a CSV fallback"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.15"
 dependencies = [
     "mcp>=2.3",
     "plaid-python>=46.0",

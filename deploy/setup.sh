@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time server setup for personal-finance-mcp on Ubuntu 24.04 or Oracle Linux 9 (systemd >= 250).
+# One-time server setup for personal-finance-mcp on Ubuntu 24.04 or 26.04, or Oracle Linux 9 (systemd >= 250).
 # Run as root from the unpacked code in /opt/personal-finance-mcp:  sudo bash deploy/setup.sh
 # Safe to re-run after updating the code. It does not start the service; docs/REMOTE.md says when.
 set -euo pipefail
@@ -14,17 +14,20 @@ if [[ "$(cd "$(dirname "$0")/.." && pwd)" != "$APP" ]]; then
 fi
 systemd_version=$(systemctl --version | awk 'NR==1 {print $2}')
 if (( systemd_version < 250 )); then
-    echo "systemd $systemd_version is too old: LoadCredentialEncrypted= needs 250+ (Ubuntu 24.04, Oracle Linux 9)" >&2
+    echo "systemd $systemd_version is too old: LoadCredentialEncrypted= needs 250+ (Ubuntu 24.04 or 26.04, Oracle Linux 9)" >&2
     exit 1
 fi
 
 echo "== packages"
 if command -v apt-get >/dev/null; then
     apt-get update -q
-    DEBIAN_FRONTEND=noninteractive apt-get install -yq python3.12 python3.12-venv ca-certificates
+    # the release's own python3: 3.12 on Ubuntu 24.04, 3.14 on 26.04 (pyproject.toml allows 3.12 to 3.14)
+    DEBIAN_FRONTEND=noninteractive apt-get install -yq python3 python3-venv ca-certificates
+    PYTHON=python3
     command -v curl >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -yq curl
 elif command -v dnf >/dev/null; then
-    dnf install -y python3.12 ca-certificates
+    dnf install -y python3.12 ca-certificates  # EL9's python3 is 3.9, too old
+    PYTHON=python3.12
     # EL9 ships curl-minimal, which conflicts with the curl package; either one is fine
     command -v curl >/dev/null || dnf install -y curl
 else
@@ -65,8 +68,9 @@ fi
 
 echo "== dependencies (locked)"
 cd "$APP"
-# only-system: use the distribution's python3.12, never a downloaded interpreter
-UV_PYTHON_PREFERENCE=only-system UV_PROJECT_ENVIRONMENT="$APP/.venv" uv sync --frozen --no-dev --python python3.12
+# only-system: use the distribution's Python, never a downloaded interpreter. After a release upgrade changes the
+# Python version, re-running this rebuilds .venv for the new interpreter.
+UV_PYTHON_PREFERENCE=only-system UV_PROJECT_ENVIRONMENT="$APP/.venv" uv sync --frozen --no-dev --python "$PYTHON"
 chown -R root:root "$APP"
 chmod -R go-w "$APP"
 
